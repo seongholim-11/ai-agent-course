@@ -1,0 +1,28 @@
+---
+interface Props { week: string; prompt?: string }
+const { week, prompt = '이번 주에 막혔던 것, 실패하고 고친 것, 면접에서 말할 거리를 적어두세요.' } = Astro.props;
+---
+<section class="aac-notes not-content" data-week={week}>
+  <label>
+    <strong>학습 회고 메모</strong>
+    <span class="aac-hint">{prompt}</span>
+    <textarea rows="6" placeholder="- 실패: ...&#10;- 원인: ...&#10;- 해결: ...&#10;- 수치: ..."></textarea>
+  </label>
+  <span class="aac-saved aac-hint" aria-live="polite"></span>
+</section>
+
+<script>
+  document.querySelectorAll<HTMLElement>('.aac-notes').forEach((root) => {
+    const key = `aac:notes:${root.dataset.week}`;
+    const ta = root.querySelector('textarea')!;
+    const saved = root.querySelector('.aac-saved')!;
+    try { ta.value = localStorage.getItem(key) || ''; } catch {}
+    let t: number | undefined;
+    ta.addEventListener('input', () => {
+      clearTimeout(t);
+      t = window.setTimeout(() => {
+        try { localStorage.setItem(key, ta.value); saved.textContent = '저장됨'; } catch { saved.textContent = '이 브라우저에서는 저장할 수 없습니다'; }
+      }, 400);
+    });
+  });
+</script>

@@ -1,0 +1,234 @@
+---
+title: "3주차 · LLM 기초: 토큰, 컨텍스트, API, 비용"
+description: 에이전트를 설계할 때 필요한 LLM의 동작 원리, API 구조, 비용 계산, 캐싱, 임베딩을 다룹니다.
+sidebar:
+  order: 3
+  label: "3주차 · LLM 기초"
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Checklist from '../../../components/Checklist.astro';
+import Notes from '../../../components/Notes.astro';
+
+<Aside type="note" title="원본 강의">
+Part06 부록: LLM 시대에 AI Engineer로 취업하기 위한 사전지식. Part01 앞부분의 LLM 한계(hallucination, memory) 설명도 함께 들으세요.
+</Aside>
+
+## 학습 목표
+
+- LLM이 다음 토큰을 예측하는 방식과 그 결과(환각, 비결정성)를 설명한다
+- 컨텍스트 윈도우, 토큰, 샘플링 파라미터가 에이전트 설계에 주는 제약을 안다
+- 주요 공급자 API의 메시지 구조를 이해하고 직접 호출한다
+- 요청 비용을 계산하고 프롬프트 캐싱으로 줄인다
+- 임베딩이 무엇이고 어디에 쓰는지 안다
+
+## 핵심 개념
+
+### 1. LLM은 무엇을 하는가
+
+LLM은 지금까지의 토큰 시퀀스를 보고 **다음 토큰의 확률 분포**를 계산한 뒤 하나를 뽑는 일을 반복합니다. 여기서 에이전트 설계에 중요한 결과가 나옵니다.
+
+- **환각:** 모델은 "그럴듯한" 토큰을 고를 뿐 사실 여부를 확인하지 않습니다. 그래서 사실은 검색·도구로 주입하고(RAG), 출력은 검증해야 합니다.
+- **비결정성:** temperature 0에서도 서버의 배치 처리·부동소수점 연산 순서 때문에 결과가 미세하게 달라질 수 있습니다. 평가를 여러 번 돌리는 이유입니다.
+- **상태 없음:** 모델은 이전 호출을 기억하지 않습니다. 매 호출마다 대화 전체를 다시 보냅니다. "메모리"는 전부 애플리케이션이 구현하는 것입니다.
+
+### 2. 토큰과 컨텍스트 윈도우
+
+- 토큰은 단어보다 작은 단위입니다. 영어는 대략 1토큰 ≈ 4글자, **한국어는 같은 의미에 영어보다 토큰이 더 많이** 듭니다. 한국어 서비스는 비용 추정 시 이를 반영해야 합니다.
+- 컨텍스트 윈도우는 **입력 + 출력** 토큰의 최대 합입니다. 수십만~백만 토큰을 지원하는 모델이 많지만, 길수록 비싸고 느리며 **긴 컨텍스트 중간의 정보를 놓치는 경향**(lost in the middle, context rot)이 있습니다. 11주차 컨텍스트 엔지니어링의 출발점입니다.
+
+### 3. 메시지 구조
+
+공급자마다 이름은 다르지만 구조는 같습니다.
+
+```python
+import anthropic
+client = anthropic.Anthropic()
+
+resp = client.messages.create(
+    model="claude-haiku-4-5",          # 실습은 작은 모델로
+    max_tokens=512,
+    system="너는 간결하게 답하는 한국어 비서다.",   # 시스템 프롬프트: 역할·규칙
+    messages=[
+        {"role": "user", "content": "SSE가 뭐야?"},
+        {"role": "assistant", "content": "서버가 클라이언트로 이벤트를 보내는 HTTP 스트림이야."},
+        {"role": "user", "content": "WebSocket이랑 차이는?"},
+    ],
+)
+print(resp.content[0].text)
+print(resp.usage)   # input_tokens, output_tokens, cache_* 토큰
+```
+
+```python
+from openai import OpenAI
+client = OpenAI()
+resp = client.responses.create(
+    model="gpt-5-mini",
+    instructions="너는 간결하게 답하는 한국어 비서다.",
+    input="SSE가 뭐야?",
+)
+print(resp.output_text, resp.usage)
+```
+
+<Aside type="caution" title="모델 이름">
+모델 이름과 가격은 자주 바뀝니다. 코드에 하드코딩하지 말고 설정 파일이나 환경 변수로 빼세요. 최신 이름은 각 공급자의 모델 목록 문서에서 확인합니다.
+</Aside>
+
+### 4. 샘플링 파라미터
+
+| 파라미터 | 의미 | 에이전트에서 |
+| --- | --- | --- |
+| `temperature` | 분포를 평평하게(높음) 또는 뾰족하게(낮음) | 도구 선택·추출·분류는 낮게, 아이디어 생성은 높게 |
+| `top_p` | 누적 확률 상위 p 안에서만 샘플링 | 보통 temperature와 둘 중 하나만 조정 |
+| `max_tokens` | 출력 상한 | 너무 작으면 도구 호출 JSON이 잘려 파싱 실패 |
+| `stop` | 이 문자열이 나오면 중단 | 구조화 출력이 있으면 거의 안 씀 |
+
+추론(reasoning/thinking) 모델은 답 전에 내부 추론 토큰을 생성합니다. 추론 예산(effort, budget)을 올리면 어려운 계획·코딩 문제의 정확도가 오르지만 비용과 지연도 늘어납니다. "어느 단계에 추론을 켤지"가 설계 결정입니다.
+
+### 5. 비용 계산
+
+```
+요청 비용 = 입력토큰 × 입력단가 + 출력토큰 × 출력단가 (+ 캐시 쓰기/읽기 단가)
+```
+
+출력 단가가 입력보다 보통 4~5배 비쌉니다. 그런데 에이전트는 **매 턴마다 대화 전체를 다시 입력**하므로 실제로는 입력 비용이 지배적입니다. 10턴 루프에서 매 턴 2,000토큰씩 늘어나면, 총 입력은 2k+4k+…+20k = 110k 토큰입니다. 턴 수에 대해 **제곱으로** 늘어나는 셈입니다.
+
+### 6. 프롬프트 캐싱
+
+공급자는 이전 요청과 **앞부분(prefix)이 똑같은** 입력을 캐시해 할인된 가격(대략 정가의 10% 수준)과 짧은 지연으로 처리합니다.
+
+- 캐시는 **접두사 일치**입니다. 시스템 프롬프트 → 도구 정의 → 고정 문서 → 대화 순으로 **변하지 않는 것을 앞에** 둡니다.
+- 시스템 프롬프트에 현재 시각이나 요청 ID를 넣으면 매번 캐시가 깨집니다.
+- 에이전트 루프는 매 턴 앞부분이 같으므로 캐싱 효과가 큽니다. 19주차에서 적중률을 측정합니다.
+
+```python
+resp = client.messages.create(
+    model="claude-haiku-4-5", max_tokens=512,
+    system=[{"type": "text", "text": LONG_POLICY_DOC, "cache_control": {"type": "ephemeral"}}],
+    messages=[{"role": "user", "content": "환불 규정 요약해줘"}],
+)
+print(resp.usage.cache_creation_input_tokens, resp.usage.cache_read_input_tokens)
+```
+
+### 7. 임베딩
+
+임베딩 모델은 텍스트를 수백~수천 차원의 벡터로 바꿉니다. 의미가 비슷하면 벡터의 **코사인 유사도**가 높습니다. RAG 검색, 중복 제거, 클러스터링, 라우팅, 메모리 검색에 씁니다.
+
+```python
+import numpy as np
+from openai import OpenAI
+c = OpenAI()
+texts = ["환불은 7일 이내 가능합니다", "구매 후 일주일 안에 반품할 수 있어요", "배송은 2일 걸립니다"]
+E = np.array([d.embedding for d in c.embeddings.create(model="text-embedding-3-small", input=texts).data])
+E /= np.linalg.norm(E, axis=1, keepdims=True)
+print(E @ E.T)   # 0번과 1번의 유사도가 가장 높다
+```
+
+## 심화
+
+### 지연 시간의 구성
+
+- **TTFT(Time To First Token):** 입력을 처리하는 prefill 시간. 입력이 길수록 길어지고, 캐시 적중 시 크게 줄어듭니다.
+- **TPOT(Time Per Output Token):** 디코딩 속도. 출력 토큰 수에 비례합니다.
+- 에이전트 전체 지연 = Σ(턴별 TTFT + 출력 시간) + 도구 실행 시간. 그래서 **턴 수를 줄이는 것**(병렬 도구 호출, 더 좋은 계획)이 가장 큰 지연 개선입니다.
+
+### 공급자 추상화 계층을 어떻게 만들까
+
+여러 공급자를 쓰려면 얇은 추상화가 필요하지만, 너무 두껍게 만들면 공급자 고유 기능(캐싱, 추론 예산, 서버 도구)을 못 씁니다. 실무 원칙:
+
+1. 내부 표준 메시지 형식을 정하고 공급자별 어댑터에서 변환한다.
+2. 사용량(토큰, 캐시, 비용)은 **항상 같은 형식으로 기록**한다.
+3. 고유 기능은 `provider_options` 같은 탈출구로 열어둔다.
+4. 이미 잘 만든 게이트웨이(LiteLLM 등)를 쓸지 직접 만들지는 19주차에 다시 판단한다.
+
+### 토크나이저 차이와 비용 추정
+
+같은 문장도 모델마다 토큰 수가 다릅니다. 비용 추정은 반드시 **실제 API 응답의 usage**로 하고, 사전 추정이 필요하면 공급자의 토큰 카운트 API를 씁니다.
+
+## 실습 과제: 공통 LLM 클라이언트
+
+`libs/llm/`에 만들고 이후 모든 주차에서 재사용합니다.
+
+**요구사항**
+
+1. `complete(messages, model, **opts) -> Completion`과 `stream(...)` 두 함수. Claude와 OpenAI 두 공급자를 지원한다.
+2. `Completion`은 `text`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cost_usd`, `latency_ms`, `ttft_ms`를 갖는다.
+3. 가격표는 `prices.yaml`로 분리한다.
+4. 1주차의 재시도·백오프를 적용한다.
+5. 모든 호출을 JSONL 파일에 기록한다(시간, 모델, 토큰, 비용, 지연).
+6. 실험 노트북: 같은 질문을 temperature 0 / 0.7 / 1.0으로 각 5회 호출해 결과 다양성을 비교하고, 긴 시스템 프롬프트(3,000토큰 이상)로 캐싱 전후 비용·TTFT를 비교한다.
+
+**시작 코드**
+
+```python
+# libs/llm/types.py
+from dataclasses import dataclass
+
+@dataclass
+class Completion:
+    text: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int = 0
+    cost_usd: float = 0.0
+    latency_ms: int = 0
+    ttft_ms: int | None = None
+
+def cost(model: str, inp: int, out: int, cache_read: int, prices: dict) -> float:
+    p = prices[model]  # {"input": 1.0, "output": 5.0, "cache_read": 0.1}  (USD / 1M tokens)
+    return ((inp - cache_read) * p["input"] + cache_read * p["cache_read"] + out * p["output"]) / 1_000_000
+```
+
+**채점 기준**
+
+- [ ] 공급자를 바꿔도 호출 코드는 한 줄(model 이름)만 바뀐다
+- [ ] 캐싱 실험에서 두 번째 호출의 `cache_read_tokens > 0`이고 비용이 줄었다
+- [ ] 로그 JSONL로 하루 총비용을 계산하는 스크립트가 있다
+
+## 흔한 실수
+
+- `max_tokens`를 너무 작게 줘서 응답이 잘림 → `stop_reason`/`finish_reason`이 `max_tokens`인지 항상 확인합니다.
+- 대화 기록을 무한정 쌓음 → 비용이 턴 수의 제곱으로 늘어납니다.
+- 시스템 프롬프트에 날짜·사용자 이름을 앞쪽에 넣음 → 캐시가 매번 깨집니다. 변하는 값은 뒤쪽 사용자 메시지에 넣으세요.
+
+## 면접 질문
+
+<details>
+<summary>LLM은 왜 환각을 일으키나요? 에이전트에서는 어떻게 줄이나요?</summary>
+
+LLM은 사실을 조회하는 것이 아니라 학습 분포상 그럴듯한 다음 토큰을 생성하기 때문에, 모르는 내용도 자신 있게 지어낼 수 있습니다. 에이전트에서는 ① 검색·DB·API 도구로 근거를 주입하고(grounding), ② 답변에 출처를 달게 하고, ③ 근거가 없으면 "모른다"고 답하도록 지시·평가하고, ④ 구조화 출력과 검증 단계(스키마 검증, 사실 확인 에이전트)를 둡니다. 그리고 환각률을 평가 세트로 측정합니다.
+</details>
+
+<details>
+<summary>컨텍스트 윈도우가 100만 토큰이면 RAG가 필요 없지 않나요?</summary>
+
+아닙니다. 첫째, 비용과 지연이 입력 길이에 비례해 커집니다. 둘째, 긴 컨텍스트에서는 중간 정보를 놓치거나 관련 없는 정보에 주의가 분산되어 정확도가 떨어집니다. 셋째, 실제 지식 베이스는 수백만 토큰을 넘고 계속 바뀝니다. 넷째, 권한별로 볼 수 있는 문서가 다릅니다. 긴 컨텍스트는 "검색한 결과를 넉넉히 넣을 수 있게" 해주는 것이지 검색을 대체하지 않습니다. 작은 고정 문서는 통째로 넣고 캐싱하는 편이 나을 수 있습니다.
+</details>
+
+<details>
+<summary>에이전트 비용이 예상보다 훨씬 많이 나오는 이유는?</summary>
+
+매 턴마다 지금까지의 대화와 도구 결과 전체를 다시 입력하기 때문에 입력 토큰이 턴 수에 대해 제곱으로 늘어납니다. 큰 도구 결과(웹페이지 전문, 긴 JSON)를 그대로 넣거나, 실패한 도구를 반복 호출하거나, 멀티 에이전트가 같은 컨텍스트를 여러 번 읽는 것도 원인입니다. 프롬프트 캐싱, 도구 결과 요약·절단, 반복 제한, 작은 모델 라우팅, compaction으로 줄입니다.
+</details>
+
+<details>
+<summary>프롬프트 캐싱이 동작하는 조건은?</summary>
+
+입력의 앞부분(prefix)이 이전 요청과 바이트 단위로 같아야 하고, 공급자가 정한 최소 길이 이상이며, 캐시 유효 시간(보통 수 분, 옵션으로 더 길게) 안에 다시 요청해야 합니다. 그래서 시스템 프롬프트, 도구 정의, 고정 문서처럼 변하지 않는 것을 앞에 두고, 변하는 값은 뒤에 둡니다. 도구 목록 순서를 바꾸거나 시스템 프롬프트에 타임스탬프를 넣으면 캐시가 깨집니다.
+</details>
+
+<details>
+<summary>temperature 0이면 항상 같은 답이 나오나요?</summary>
+
+대체로 비슷하지만 보장되지 않습니다. 서버 측 배치 구성, 병렬 연산 순서, 하드웨어 차이로 로짓이 미세하게 달라져 다른 토큰이 선택될 수 있습니다. 그래서 재현성이 중요한 평가는 같은 입력을 여러 번 돌려 분포로 보고, 테스트는 정확한 문자열 대신 의미·구조 기준으로 검증합니다.
+</details>
+
+## 더 읽기
+
+- [Anthropic: Prompt caching](https://docs.claude.com/en/docs/build-with-claude/prompt-caching)
+- [OpenAI: Responses API](https://platform.openai.com/docs/api-reference/responses)
+- [Lost in the Middle (Liu et al., 2023)](https://arxiv.org/abs/2307.03172)
+
+<Checklist week="w03" />
+<Notes week="w03" />

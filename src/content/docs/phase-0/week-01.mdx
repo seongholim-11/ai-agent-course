@@ -1,0 +1,236 @@
+---
+title: "1주차 · 실무 파이썬: 타입, 비동기, 테스트"
+description: 에이전트 코드의 기반이 되는 Pydantic, asyncio 동시성 제어, pytest를 다룹니다.
+sidebar:
+  order: 1
+  label: "1주차 · 실무 파이썬"
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Checklist from '../../../components/Checklist.astro';
+import Notes from '../../../components/Notes.astro';
+
+<Aside type="note" title="원본 강의">
+[부록] 파이썬 필수 문법 & 백엔드의 이해: 파이썬 문법 클립 전체. 이미 익숙하다면 1.5배속으로 훑고 이 페이지의 심화 부분에 시간을 쓰세요.
+</Aside>
+
+## 학습 목표
+
+- 에이전트 코드에서 쓰는 파이썬 기능을 **왜** 쓰는지 설명할 수 있다
+- 타입 힌트와 Pydantic으로 LLM 입출력을 검증한다
+- asyncio로 여러 도구·API 호출을 동시에 처리하고, 동시성을 제한·취소한다
+- 비동기 코드를 테스트한다
+
+## 왜 이게 에이전트의 기초인가
+
+에이전트의 실행 시간 대부분은 **기다리는 시간**입니다. LLM 응답, 웹 검색, DB 조회가 모두 네트워크 I/O입니다. 도구 5개를 순서대로 부르면 5초, 동시에 부르면 1초입니다. 그리고 LLM은 문자열을 내놓기 때문에, 그 문자열을 믿을 수 있는 데이터로 바꾸는 **검증 계층**이 필요합니다. 이번 주의 두 축이 바로 이것입니다.
+
+## 핵심 개념
+
+### 1. 타입 힌트와 Pydantic
+
+LLM 도구의 입력 스키마는 결국 JSON Schema입니다. Pydantic 모델 하나로 **검증, 직렬화, JSON Schema 생성**을 모두 얻을 수 있습니다.
+
+```python
+from typing import Literal
+from pydantic import BaseModel, Field, field_validator
+
+class SearchArgs(BaseModel):
+    """웹에서 최신 정보를 검색한다."""
+    query: str = Field(min_length=2, description="검색어. 구체적인 키워드로.")
+    max_results: int = Field(default=5, ge=1, le=20)
+    recency: Literal["day", "week", "month", "any"] = "any"
+
+    @field_validator("query")
+    @classmethod
+    def strip(cls, v: str) -> str:
+        return v.strip()
+
+# LLM이 준 인자 검증
+args = SearchArgs.model_validate_json('{"query": "  MCP spec  ", "max_results": 3}')
+print(args.query)                 # "MCP spec"
+print(SearchArgs.model_json_schema())  # 도구 정의에 그대로 쓸 수 있다
+```
+
+`ValidationError`가 나면 그 에러 메시지를 **그대로 모델에게 돌려주는 것**이 에이전트에서 가장 흔한 복구 방식입니다(4주차에서 구현).
+
+### 2. asyncio의 핵심 모델
+
+- **코루틴**(`async def`)은 호출만 해서는 실행되지 않습니다. `await`하거나 태스크로 등록해야 합니다.
+- **이벤트 루프**는 한 스레드에서 여러 코루틴을 번갈아 실행합니다. I/O 대기 중에 다른 코루틴으로 넘어갑니다.
+- 따라서 `time.sleep()`, `requests.get()` 같은 **블로킹 호출을 async 함수 안에서 쓰면 루프 전체가 멈춥니다.** `httpx.AsyncClient`, `asyncio.sleep`을 쓰거나, 어쩔 수 없으면 `asyncio.to_thread()`로 감쌉니다.
+
+```python
+import asyncio, httpx
+
+async def fetch(client: httpx.AsyncClient, url: str) -> int:
+    r = await client.get(url, timeout=10)
+    return r.status_code
+
+async def main(urls: list[str]):
+    async with httpx.AsyncClient() as client:
+        # gather: 결과를 입력 순서대로 모은다
+        results = await asyncio.gather(*(fetch(client, u) for u in urls), return_exceptions=True)
+    return results
+```
+
+### 3. gather vs TaskGroup
+
+| | `asyncio.gather` | `asyncio.TaskGroup` (3.11+) |
+| --- | --- | --- |
+| 하나가 실패하면 | 기본은 첫 예외를 올리지만 **나머지 태스크는 계속 돈다** | 나머지를 **취소**하고 `ExceptionGroup`으로 모아 올린다 |
+| 부분 실패 허용 | `return_exceptions=True`로 쉽게 | 각 태스크 안에서 try/except 필요 |
+| 적합한 상황 | 병렬 검색처럼 "일부 실패해도 계속" | 트랜잭션처럼 "하나라도 실패하면 전부 중단" |
+
+에이전트의 병렬 도구 호출은 보통 **부분 실패 허용**이 맞습니다. 실패한 도구는 에러 메시지를 결과로 돌려주고 모델이 판단하게 합니다.
+
+### 4. 동시성 제한과 타임아웃
+
+LLM API에는 분당 요청 수(RPM)·토큰 수(TPM) 제한이 있습니다. 문서 1,000개를 동시에 요약시키면 바로 429 에러가 납니다.
+
+```python
+sem = asyncio.Semaphore(8)  # 동시에 최대 8개
+
+async def limited(coro_fn, *args):
+    async with sem:
+        return await asyncio.wait_for(coro_fn(*args), timeout=30)
+```
+
+## 심화
+
+### 지수 백오프와 지터
+
+429·529·503은 재시도할 가치가 있는 에러이고, 400·401은 아닙니다. 재시도 간격은 `base * 2**attempt`에 **무작위 지터**를 더해야 여러 워커가 동시에 재시도하는 "thundering herd"를 피할 수 있습니다. 공급자가 `retry-after` 헤더를 주면 그 값을 우선합니다.
+
+```python
+import random
+
+RETRYABLE = {408, 409, 429, 500, 502, 503, 504, 529}
+
+async def with_retry(fn, *, attempts=5, base=0.5, cap=20):
+    for i in range(attempts):
+        try:
+            return await fn()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code not in RETRYABLE or i == attempts - 1:
+                raise
+            ra = e.response.headers.get("retry-after")
+            delay = float(ra) if ra else min(cap, base * 2 ** i) * random.uniform(0.5, 1.5)
+            await asyncio.sleep(delay)
+```
+
+### 취소(cancellation)는 기능이다
+
+사용자가 "중지"를 누르거나 타임아웃이 나면 진행 중인 LLM 호출과 도구 실행을 **실제로 멈춰야** 비용이 멈춥니다. `asyncio.CancelledError`를 삼키지 마세요(`except Exception`은 괜찮지만 `except BaseException`은 위험). 정리 작업은 `finally`에서 합니다.
+
+### 구조화된 동시성으로 생각하기
+
+"이 태스크는 누가 소유하고, 누가 끝을 기다리는가?"가 명확해야 누수(leak)가 없습니다. `asyncio.create_task()`로 던져놓고 잊은 태스크는 예외가 조용히 사라지고, 참조가 없으면 가비지 컬렉션될 수도 있습니다. TaskGroup 안에서 만들거나, 참조를 보관하세요.
+
+### 제너레이터와 스트리밍
+
+LLM 스트리밍은 `async for chunk in stream:` 형태의 **비동기 이터레이터**입니다. 직접 `async def ... yield`로 비동기 제너레이터를 만들 줄 알면 2주차 SSE 구현이 쉬워집니다.
+
+```python
+async def tokens(stream):
+    async for event in stream:
+        if event.type == "content_block_delta":
+            yield event.delta.text
+```
+
+## 실습 과제: 비동기 URL 수집·요약기
+
+`weeks/w01_async_crawler/`에 만듭니다.
+
+**요구사항**
+
+1. URL 목록(최소 30개)을 받아 동시에 가져온다. 동시 요청은 최대 5개.
+2. 각 요청은 10초 타임아웃, 재시도 가능한 에러는 지수 백오프로 최대 3회 재시도.
+3. 결과를 Pydantic 모델 `PageResult(url, status, title, elapsed_ms, error)`로 반환한다.
+4. 일부가 실패해도 전체는 끝까지 돈다.
+5. 순차 실행과 병렬 실행의 총 소요 시간을 비교해 출력한다.
+6. pytest로 최소 3개 테스트: 성공, 타임아웃, 재시도 후 성공 (`respx`나 가짜 서버로 네트워크를 흉내 낸다).
+
+**시작 코드**
+
+```python
+# weeks/w01_async_crawler/crawler.py
+import asyncio, time, re
+import httpx
+from pydantic import BaseModel
+
+class PageResult(BaseModel):
+    url: str
+    status: int | None = None
+    title: str | None = None
+    elapsed_ms: int
+    error: str | None = None
+
+async def fetch_one(client: httpx.AsyncClient, url: str, sem: asyncio.Semaphore) -> PageResult:
+    t0 = time.perf_counter()
+    async with sem:
+        try:
+            # TODO: 재시도 로직 적용
+            r = await client.get(url, timeout=10, follow_redirects=True)
+            m = re.search(r"<title>(.*?)</title>", r.text, re.I | re.S)
+            return PageResult(url=url, status=r.status_code, title=m and m.group(1).strip(),
+                              elapsed_ms=int((time.perf_counter() - t0) * 1000))
+        except Exception as e:
+            return PageResult(url=url, error=repr(e), elapsed_ms=int((time.perf_counter() - t0) * 1000))
+
+async def crawl(urls: list[str], concurrency: int = 5) -> list[PageResult]:
+    sem = asyncio.Semaphore(concurrency)
+    async with httpx.AsyncClient(headers={"User-Agent": "agent-lab/0.1"}) as client:
+        return await asyncio.gather(*(fetch_one(client, u, sem) for u in urls))
+```
+
+**채점 기준 (스스로)**
+
+- [ ] 병렬 실행이 순차 대비 4배 이상 빠르다
+- [ ] 동시 요청 수가 5를 넘지 않음을 로그로 증명했다
+- [ ] 테스트가 실제 네트워크 없이 통과한다
+- [ ] `ruff check`가 깨끗하다
+
+**확장 과제:** 각 페이지 제목을 LLM으로 한 줄 요약하는 단계를 추가하고, LLM 호출에는 별도 Semaphore(2)를 둡니다. 왜 I/O 종류마다 다른 한도를 두는지 README에 적으세요.
+
+## 흔한 실수
+
+- async 함수 안에서 `requests` 사용 → 루프 블로킹. 동시성이 전혀 생기지 않습니다.
+- `asyncio.run()`을 이미 루프가 도는 곳(Jupyter, FastAPI 안)에서 호출 → 에러. Jupyter에서는 바로 `await`합니다.
+- `except Exception: pass`로 에러 삼키기 → 에이전트가 "도구가 성공했다"고 착각합니다. 에러는 반드시 결과에 담으세요.
+- `httpx.AsyncClient`를 요청마다 새로 만들기 → 커넥션 풀을 못 써서 느려집니다.
+
+## 면접 질문
+
+<details>
+<summary>파이썬 GIL이 있는데 asyncio가 왜 빨라지나요?</summary>
+
+GIL은 한 번에 한 스레드만 **파이썬 바이트코드**를 실행하게 하지만, I/O를 기다리는 동안에는 CPU를 쓰지 않습니다. asyncio는 한 스레드에서 I/O 대기 시간을 겹쳐서 활용하는 방식이라 GIL과 무관하게 I/O 바운드 작업이 빨라집니다. 반대로 CPU 바운드 작업(대량 파싱, 임베딩 계산)은 asyncio로 빨라지지 않으며 프로세스 풀이나 네이티브 라이브러리가 필요합니다. 에이전트는 대부분 I/O 바운드라 asyncio가 잘 맞습니다.
+</details>
+
+<details>
+<summary>gather와 TaskGroup 중 병렬 도구 호출에는 무엇을 쓰나요?</summary>
+
+도구 중 일부가 실패해도 나머지 결과로 모델이 판단할 수 있어야 하므로, 보통 `gather(..., return_exceptions=True)`나 각 태스크 내부에서 예외를 결과로 변환하는 방식을 씁니다. TaskGroup은 하나가 실패하면 나머지를 취소하므로 "모두 성공해야 의미가 있는" 작업에 맞습니다. 어느 쪽이든 타임아웃과 동시성 제한을 함께 둡니다.
+</details>
+
+<details>
+<summary>LLM API 429 에러는 어떻게 처리하나요?</summary>
+
+재시도 가능한 에러로 분류하고, `retry-after` 헤더가 있으면 따르고 없으면 지터를 섞은 지수 백오프로 재시도합니다. 근본적으로는 Semaphore나 토큰 버킷으로 요청률을 공급자 한도 아래로 유지하고, 여러 워커가 있으면 Redis 같은 공유 저장소로 전역 레이트 리밋을 둡니다. 한도에 자주 닿으면 배치 API, 캐싱, 작은 모델로 분산하는 것도 방법입니다.
+</details>
+
+<details>
+<summary>Pydantic을 에이전트에서 어디에 쓰나요?</summary>
+
+세 군데입니다. 도구 입력 스키마 정의(JSON Schema 자동 생성), LLM의 구조화 출력 검증(검증 실패 시 에러를 모델에 돌려 재시도), API 요청·응답 모델(FastAPI)입니다. 하나의 모델이 문서, 검증, 직렬화의 단일 출처가 되므로 스키마와 코드가 어긋나는 버그를 줄입니다.
+</details>
+
+## 더 읽기
+
+- [Python 공식 문서: asyncio Task와 TaskGroup](https://docs.python.org/3/library/asyncio-task.html)
+- [Pydantic 문서](https://docs.pydantic.dev/latest/)
+- [HTTPX Async 가이드](https://www.python-httpx.org/async/)
+
+<Checklist week="w01" />
+<Notes week="w01" />

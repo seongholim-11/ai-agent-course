@@ -1,0 +1,52 @@
+---
+title: AI Agent 엔지니어 코스
+description: 24주 동안 AI 에이전트를 설계·평가·보호·배포하는 엔지니어가 되는 개인 강의 사이트
+template: splash
+hero:
+  tagline: 에이전트 루프를 맨손으로 짜는 것부터 멀티 에이전트, MCP, 컨텍스트 엔지니어링, 평가, 보안, 프로덕션 운영까지. 24주 실습 중심 커리큘럼.
+  actions:
+    - text: 1주차 시작하기
+      link: phase-0/week-01/
+      icon: right-arrow
+    - text: 진도 대시보드
+      link: dashboard/
+      icon: list-format
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## 이 코스가 목표로 하는 것
+
+에이전트를 **만들 줄 아는 사람**이 아니라 **품질을 측정하고, 안전하게 운영하고, 왜 그렇게 설계했는지 설명할 수 있는 사람**이 되는 것입니다. 2026년 채용 시장에서 신입 대상 AI 엔지니어 공고는 6% 남짓이고, 회사들이 에이전트 도입의 가장 큰 장애물로 꼽는 것은 "품질"입니다. 그래서 이 코스는 주니어 수준을 넘어 평가·관측·보안·신뢰성까지 깊게 다룹니다.
+
+<CardGrid>
+  <Card title="Phase 0–1 · 기초와 싱글 에이전트" icon="rocket">
+    비동기 파이썬, FastAPI, LLM API, 맨손 에이전트 루프, 설계 패턴, RAG와 Agentic RAG.
+  </Card>
+  <Card title="Phase 2–3 · 멀티 에이전트와 컨텍스트" icon="puzzle">
+    LangGraph, 오케스트레이션 패턴, MCP, A2A, 컨텍스트 엔지니어링, Deep Agent, Skills, 메모리.
+  </Card>
+  <Card title="Phase 4–5 · 평가와 보안" icon="approve-check">
+    평가 세트 설계, LLM-as-judge 검증, 트레이싱, CI 평가, 프롬프트 인젝션 위협 모델과 방어.
+  </Card>
+  <Card title="Phase 6–7 · 프로덕션과 취업" icon="star">
+    비용·지연 최적화, vLLM 서빙, durable execution, 포트폴리오, 시스템 디자인 면접.
+  </Card>
+</CardGrid>
+
+## 각 주차 페이지의 구성
+
+1. **학습 목표**와 패스트캠퍼스 「AI Agent 바이블」 중 들을 파트
+2. **핵심 개념**: 원리부터 코드까지
+3. **심화**: 주니어 수준을 넘어서는 설계 판단과 트레이드오프
+4. **실습 과제**: 시작 코드, 요구사항, 스스로 채점하는 기준
+5. **흔한 실수**와 **면접 질문**(펼치면 모범 답안)
+6. **완료 체크리스트**와 **회고 메모** (브라우저에 저장)
+
+<CardGrid>
+  <LinkCard title="코스 사용법" href="guide/how-to-use/" description="주간 루틴, 원본 강의와 함께 듣는 법, 진도 저장 방식" />
+  <LinkCard title="개발 환경 세팅" href="guide/setup/" description="uv, Docker, API 키, 실습 저장소 구조" />
+  <LinkCard title="면접 질문 은행" href="interview/question-bank/" description="이 코스를 끝내면 답할 수 있어야 하는 핵심 질문과 모범 답안" />
+  <LinkCard title="포트폴리오 프로젝트" href="projects/overview/" description="채용 담당자가 보는 5개 대표 프로젝트와 평가 기준" />
+</CardGrid>

@@ -1,0 +1,96 @@
+---
+title: 개발 환경 세팅
+description: uv, Docker, API 키, 실습 모노레포 구조
+sidebar:
+  order: 2
+---
+
+import { Steps, Aside, FileTree, Tabs, TabItem } from '@astrojs/starlight/components';
+
+## 필요한 도구
+
+| 도구 | 용도 | 확인 명령 |
+| --- | --- | --- |
+| Python 3.12+ | 모든 실습의 기본 언어 | `python --version` |
+| [uv](https://docs.astral.sh/uv/) | 파이썬 버전·가상환경·의존성 관리 | `uv --version` |
+| Docker Desktop | DB, 벡터 DB, 관측 도구, 샌드박스 | `docker compose version` |
+| Git + GitHub 계정 | 버전 관리, 포트폴리오 | `git --version` |
+| Node.js 20+ | MCP Inspector, 일부 프론트엔드 | `node --version` |
+| 코딩 에이전트 1개 | Claude Code, Cursor, Codex 등 | — |
+
+<Steps>
+
+1. **uv 설치**
+
+   <Tabs>
+     <TabItem label="macOS / Linux">
+     ```bash
+     curl -LsSf https://astral.sh/uv/install.sh | sh
+     ```
+     </TabItem>
+     <TabItem label="Windows">
+     ```powershell
+     powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+     ```
+     </TabItem>
+   </Tabs>
+
+2. **실습 모노레포 만들기**
+
+   ```bash
+   mkdir agent-lab && cd agent-lab
+   git init
+   uv init --python 3.12
+   uv add httpx pydantic python-dotenv anthropic openai
+   uv add --dev pytest pytest-asyncio ruff
+   ```
+
+3. **API 키 준비**: `.env` 파일을 만들고 **절대 커밋하지 않습니다**.
+
+   ```bash title=".env"
+   ANTHROPIC_API_KEY=sk-ant-...
+   OPENAI_API_KEY=sk-...
+   # 선택
+   GEMINI_API_KEY=...
+   TAVILY_API_KEY=...      # 웹 검색 도구용
+   LANGFUSE_PUBLIC_KEY=... # 15주차부터
+   LANGFUSE_SECRET_KEY=...
+   ```
+
+   ```bash
+   echo ".env" >> .gitignore
+   ```
+
+4. **공급자 콘솔에서 지출 한도 설정**: 실습 중 루프가 폭주하면 하룻밤에 수십 달러가 나갈 수 있습니다. 월 한도를 $20~30으로 걸어두세요.
+
+</Steps>
+
+## 권장 저장소 구조
+
+<FileTree>
+- agent-lab/
+  - .env (커밋 금지)
+  - pyproject.toml
+  - docker-compose.yml postgres, redis, qdrant, langfuse
+  - libs/
+    - llm/ 3주차 공통 LLM 클라이언트
+  - weeks/
+    - w01_async_crawler/
+    - w04_agent_loop/
+    - w06_rag_bot/
+    - …
+  - projects/
+    - report-agent/ 대표 프로젝트 1
+    - eval-pipeline/ 대표 프로젝트 5
+  - evals/ 평가 세트(JSONL)
+</FileTree>
+
+## 비용 감각
+
+<Aside type="caution" title="실습 비용 예상">
+대부분의 실습은 작은 모델(Haiku급, mini급)로 충분합니다. 큰 모델은 평가 judge나 최종 비교 때만 쓰세요. 이 원칙을 지키면 24주 전체 API 비용은 대체로 월 $10~30 수준입니다. 멀티 에이전트·Deep Agent 주차(8, 12, 13주)는 토큰이 많이 들어가니 반드시 `max_iterations`와 토큰 예산을 걸어두세요.
+</Aside>
+
+## 로컬 모델 (선택)
+
+GPU가 없어도 [Ollama](https://ollama.com)로 소형 오픈소스 모델을 돌려 비용 없이 루프를 디버깅할 수 있습니다. 단, 도구 호출 품질은 상용 모델보다 낮으니 최종 측정은 상용 모델로 합니다. 20주차에서는 vLLM으로 OpenAI 호환 서버를 직접 띄웁니다.

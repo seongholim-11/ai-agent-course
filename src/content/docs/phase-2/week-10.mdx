@@ -1,0 +1,193 @@
+---
+title: "10주차 · A2A와 GraphRAG"
+description: 에이전트 간 통신 프로토콜 A2A와, 지식 그래프 기반 검색 GraphRAG·Text2Cypher를 다룹니다.
+sidebar:
+  order: 10
+  label: "10주차 · A2A와 GraphRAG"
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Checklist from '../../../components/Checklist.astro';
+import Notes from '../../../components/Notes.astro';
+
+<Aside type="note" title="원본 강의">
+Part03 MCP/A2A 프로토콜. Part04 AI Agent 심화 프로젝트: GraphRAG Agent(Neo4j ToolsRetriever, Text2Cypher 기반 Agentic RAG).
+</Aside>
+
+## 학습 목표
+
+- MCP(에이전트 ↔ 도구)와 A2A(에이전트 ↔ 에이전트)의 역할 차이를 설명한다
+- Agent Card, Task 수명주기, 메시지·아티팩트 구조를 이해하고 A2A 서버를 만든다
+- 지식 그래프가 벡터 검색보다 나은 질문 유형을 안다
+- Text2Cypher 도구를 만들고 안전하게 실행한다
+
+## Part 1. A2A (Agent2Agent)
+
+### 왜 필요한가
+
+MCP는 에이전트가 **도구**를 쓰는 규격입니다. 도구는 입력을 받으면 결과를 돌려주는 수동적인 존재입니다. 반면 다른 팀이 만든 **에이전트**는 자기만의 판단·도구·메모리를 갖고, 작업이 오래 걸리며, 중간에 질문을 되묻기도 합니다. A2A는 이런 **불투명한(opaque) 에이전트끼리** 작업을 주고받는 규격입니다. Google이 2025년 공개했고 Linux Foundation으로 이관되었습니다.
+
+```
+내 오케스트레이터 ──(MCP)──▶ 사내 DB, 검색 도구
+        │
+        └──(A2A)──▶ 법무팀 계약검토 에이전트 (다른 팀, 다른 프레임워크, 내부 구현 비공개)
+        └──(A2A)──▶ 외부 여행사 예약 에이전트
+```
+
+### 핵심 개념
+
+- **Agent Card:** 에이전트의 명함. 보통 `/.well-known/agent-card.json`에 게시하며 이름, 설명, 엔드포인트, 지원 기능(스트리밍, 푸시 알림), 인증 방식, **skills**(할 수 있는 일 목록과 예시)를 담습니다. 클라이언트는 이걸 보고 어떤 에이전트에 맡길지 정합니다.
+- **Task:** 작업 단위. 상태가 `submitted → working → (input-required) → completed / failed / canceled`처럼 바뀝니다. `input-required`는 원격 에이전트가 추가 정보를 요청하는 상태입니다.
+- **Message와 Part:** 대화 턴. Part는 텍스트, 파일, 구조화 데이터(JSON) 등입니다.
+- **Artifact:** 작업의 결과물(보고서, 파일, 데이터).
+- **전송:** JSON-RPC over HTTP(S), 스트리밍은 SSE, 오래 걸리면 푸시 알림(웹훅).
+
+```json
+{
+  "name": "contract-reviewer",
+  "description": "계약서 PDF를 받아 위험 조항과 수정 제안을 반환한다",
+  "url": "https://legal.example.com/a2a",
+  "capabilities": { "streaming": true, "pushNotifications": true },
+  "skills": [{
+    "id": "review_nda",
+    "name": "NDA 검토",
+    "description": "비밀유지계약서의 독소 조항을 찾는다",
+    "examples": ["이 NDA에서 위험한 조항 찾아줘"]
+  }]
+}
+```
+
+### MCP vs A2A
+
+| | MCP | A2A |
+| --- | --- | --- |
+| 연결 대상 | 도구·데이터 | 다른 에이전트 |
+| 상대의 성격 | 투명한 함수(스키마로 정의) | 불투명한 자율 시스템 |
+| 상호작용 | 요청 → 결과 (짧음) | 작업 수명주기, 되묻기, 장시간 |
+| 결과 | 도구 결과 | 메시지 + 아티팩트 |
+| 성숙도(2026) | 생태계가 크고 운영 사례가 많음 | 거버넌스와 채택은 늘고 있으나 프로덕션 사례는 상대적으로 적음 |
+
+두 프로토콜은 보완 관계입니다. 실제로는 원격 에이전트를 MCP 도구 하나로 감싸서 쓰는 경우도 많습니다. 면접에서는 "언제 A2A가 필요한가"를 **조직 경계**로 설명하면 좋습니다. 다른 팀이나 회사가 운영하고, 내부 구현을 공개하지 않으며, 작업이 길고 대화형이라면 A2A가 맞습니다.
+
+### 구현 스케치
+
+```python
+# a2a-sdk 사용 예시(개념 코드, API는 SDK 버전에 맞춰 확인)
+from a2a.server.agent_execution import AgentExecutor
+from a2a.utils import new_agent_text_message
+
+class SummarizerExecutor(AgentExecutor):
+    async def execute(self, context, event_queue):
+        text = context.get_user_input()
+        summary = await my_langgraph_agent.ainvoke({"messages": [("user", text)]})
+        await event_queue.enqueue_event(new_agent_text_message(summary["messages"][-1].content))
+
+    async def cancel(self, context, event_queue):
+        ...
+```
+
+SDK가 Agent Card 게시, JSON-RPC 라우팅, 작업 저장, 스트리밍을 처리하고, 개발자는 실행기(executor)만 구현합니다.
+
+## Part 2. GraphRAG
+
+### 벡터 검색이 못 하는 질문
+
+- "A사와 거래한 협력사 중 B 프로젝트에도 참여한 곳은?" → **관계를 여러 번 따라가는(multi-hop)** 질문
+- "지난 분기 매출 상위 5개 고객의 담당자는?" → **집계·정렬**
+- "이 문서 전체의 주요 주제는?" → **전역 요약** (Microsoft GraphRAG의 커뮤니티 요약이 겨냥한 문제)
+
+벡터 검색은 "비슷한 텍스트 조각"을 찾을 뿐, 엔티티 사이의 관계를 따라가거나 집계하지 못합니다.
+
+### 두 가지 GraphRAG
+
+1. **문서에서 그래프 만들기:** LLM으로 문서에서 엔티티·관계를 추출해 그래프를 만들고, 커뮤니티(클러스터)별 요약을 생성해 전역 질문에 답합니다. 구축 비용이 크고, 추출 품질이 결과를 좌우합니다.
+2. **이미 있는 그래프 질의하기:** 정형 데이터(고객, 주문, 조직도)를 Neo4j 같은 그래프 DB에 두고, 자연어를 Cypher로 바꿔(**Text2Cypher**) 질의합니다. 실무에서 더 흔하고 효과가 확실합니다.
+
+### Text2Cypher 도구
+
+```python
+SCHEMA = """
+(:Customer {id, name, tier})-[:PLACED]->(:Order {id, total, date})-[:CONTAINS]->(:Product {sku, name, category})
+(:Customer)-[:MANAGED_BY]->(:Employee {name, team})
+"""
+
+async def text2cypher(question: str) -> str:
+    cypher = await structured_llm(CypherQuery, f"""그래프 스키마:
+{SCHEMA}
+질문을 읽기 전용 Cypher로 바꿔라. MATCH/WHERE/RETURN/ORDER BY/LIMIT만 사용하고 LIMIT 50 이하로.
+질문: {question}""")
+    q = cypher.query
+    if re.search(r"\b(CREATE|MERGE|DELETE|SET|REMOVE|DROP|CALL\s+apoc|LOAD\s+CSV)\b", q, re.I):
+        return "거부: 쓰기·관리 구문은 허용되지 않습니다."
+    try:
+        async with driver.session(default_access_mode="READ") as s:      # DB 수준 읽기 전용
+            rows = await (await s.run(q, timeout=10)).data()
+        return json.dumps(rows[:50], ensure_ascii=False, default=str)
+    except Neo4jError as e:
+        return f"Cypher 오류: {e.message}. 스키마를 확인하고 다시 작성하라."   # 모델이 고칠 수 있게
+```
+
+안전장치는 세 겹입니다. 프롬프트 지시, 정규식 차단, 그리고 **가장 중요한 DB 수준 읽기 전용 계정·세션**입니다. 앞의 두 가지는 우회될 수 있습니다. Text2SQL(포트폴리오 프로젝트 4)도 같은 원칙입니다.
+
+### 정확도를 올리는 방법
+
+- 스키마에 **속성 값 예시**와 관계 방향을 명시
+- 질문-쿼리 **예시 쌍(few-shot)**을 비슷한 질문 검색으로 동적으로 넣기
+- 실행 에러를 돌려줘 자기 수정(4주차 원칙)
+- 결과가 비면 "조건을 완화해 다시 시도" 지시
+
+### 언제 그래프를 도입하나
+
+관계 질문이 핵심이고, 데이터가 이미 정형화되어 있거나 엔티티 추출을 감당할 수 있을 때입니다. 대부분의 문서 QA는 6주차의 하이브리드 RAG로 충분합니다. "그래프가 유행이라서"는 이유가 될 수 없습니다.
+
+## 실습 과제
+
+`weeks/w10_a2a_graph/`
+
+**A. A2A 연결**
+
+1. 8주차 리서치 에이전트(LangGraph)를 A2A 서버로 노출한다(Agent Card 포함).
+2. OpenAI Agents SDK나 Google ADK처럼 **다른 프레임워크로 만든** 클라이언트 에이전트가 Agent Card를 읽고 리서치를 위임한다.
+3. 스트리밍으로 진행 상황을 받고, `input-required` 상태(질문 명확화)를 한 번 처리한다.
+
+**B. GraphRAG**
+
+1. 가짜 고객·주문·제품·담당자 데이터 1,000건 이상을 Neo4j(Docker)에 적재한다.
+2. Text2Cypher 도구를 만들고 읽기 전용 세션을 강제한다.
+3. 질문 20개(단순 조회 5, multi-hop 10, 집계 5)로 정확도를 측정한다.
+4. 같은 데이터를 텍스트로 풀어 6주차 벡터 RAG로도 질의해, 질문 유형별로 비교한다.
+
+**채점 기준**
+
+- [ ] 두 프레임워크의 에이전트가 A2A로 작업을 주고받는 로그가 있다
+- [ ] `DELETE` 등을 유도하는 질문이 DB 수준에서 차단된다
+- [ ] 질문 유형별 그래프 vs 벡터 정확도 표가 있다
+
+## 면접 질문
+
+<details>
+<summary>A2A와 MCP의 차이를 설명해주세요.</summary>
+
+MCP는 에이전트가 도구와 데이터에 접근하는 수직적 연결 규격이고, A2A는 서로 독립적인 에이전트끼리 작업을 위임하고 협업하는 수평적 연결 규격입니다. MCP의 도구는 스키마로 정의된 투명한 함수지만, A2A의 상대는 내부 구현을 숨긴 자율 에이전트이며 작업 수명주기, 중간 질문, 장시간 실행, 아티팩트 반환을 다룹니다. 조직 경계를 넘는 에이전트 협업에는 A2A, 도구 통합에는 MCP를 씁니다.
+</details>
+
+<details>
+<summary>GraphRAG는 언제 필요한가요?</summary>
+
+여러 엔티티 사이의 관계를 따라가야 하는 multi-hop 질문, 집계·정렬이 필요한 질문, 문서 전체를 아우르는 전역 질문처럼 벡터 유사도 검색으로는 답하기 어려운 경우입니다. 이미 관계형·그래프형 정형 데이터가 있다면 Text2Cypher 방식이 효과적이고, 비정형 문서에서 그래프를 만드는 방식은 구축·갱신 비용이 커서 가치가 확실할 때만 씁니다. 일반 문서 QA는 하이브리드 RAG로 충분한 경우가 많습니다.
+</details>
+
+<details>
+<summary>Text2SQL/Text2Cypher를 안전하게 운영하려면?</summary>
+
+가장 중요한 것은 DB 수준의 통제입니다. 읽기 전용 계정·세션, 허용된 스키마·뷰만 접근, 행 수준 보안, 쿼리 타임아웃과 결과 행 수 제한을 둡니다. 그 위에 쓰기 구문 차단, 쿼리 비용 추정, 실행 로그를 더합니다. 프롬프트 지시만으로는 보안이 되지 않습니다. 정확도는 스키마 설명, 값 예시, 유사 질문 few-shot, 에러 기반 자기 수정, 평가 세트로 관리합니다.
+</details>
+
+## 더 읽기
+
+- [A2A 프로토콜 문서](https://a2a-protocol.org/)
+- [Microsoft GraphRAG](https://microsoft.github.io/graphrag/)
+- [Neo4j GraphRAG Python 패키지](https://neo4j.com/docs/neo4j-graphrag-python/current/)
+
+<Checklist week="w10" />
+<Notes week="w10" />

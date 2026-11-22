@@ -1,0 +1,55 @@
+---
+import { weekById } from '../data/course';
+interface Props { week: string }
+const { week } = Astro.props;
+const data = weekById(week);
+if (!data) throw new Error(`Unknown week ${week}`);
+---
+<section class="aac-checklist not-content" data-week={week}>
+  <div class="aac-checklist-head">
+    <strong>이번 주 완료 체크</strong>
+    <span class="aac-count" aria-live="polite">0 / {data.checklist.length}</span>
+  </div>
+  <div class="aac-bar"><span style="width:0%"></span></div>
+  <ul>
+    {data.checklist.map((item, i) => (
+      <li>
+        <label>
+          <input type="checkbox" data-idx={i} />
+          <span>{item}</span>
+        </label>
+      </li>
+    ))}
+  </ul>
+  <p class="aac-hint">체크 상태는 이 브라우저에 저장됩니다. 다른 기기로 옮기려면 대시보드에서 내보내기를 쓰세요.</p>
+</section>
+
+<script>
+  const KEY = 'aac:progress';
+  const load = (): Record<string, number[]> => {
+    try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch { return {}; }
+  };
+  const save = (v: Record<string, number[]>) => {
+    try { localStorage.setItem(KEY, JSON.stringify(v)); } catch {}
+  };
+  document.querySelectorAll<HTMLElement>('.aac-checklist').forEach((root) => {
+    const week = root.dataset.week!;
+    const boxes = [...root.querySelectorAll<HTMLInputElement>('input[type=checkbox]')];
+    const count = root.querySelector('.aac-count')!;
+    const bar = root.querySelector<HTMLElement>('.aac-bar span')!;
+    const render = () => {
+      const done = boxes.filter((b) => b.checked).length;
+      count.textContent = `${done} / ${boxes.length}`;
+      bar.style.width = `${Math.round((done / boxes.length) * 100)}%`;
+    };
+    const state = load();
+    (state[week] || []).forEach((i) => { if (boxes[i]) boxes[i].checked = true; });
+    render();
+    boxes.forEach((b) => b.addEventListener('change', () => {
+      const s = load();
+      s[week] = boxes.map((x, i) => (x.checked ? i : -1)).filter((i) => i >= 0);
+      save(s);
+      render();
+    }));
+  });
+</script>

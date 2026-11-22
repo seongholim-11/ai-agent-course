@@ -1,0 +1,137 @@
+---
+import { phases, weeks } from '../data/course';
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const href = (slug: string) => `${base}/${slug}/`;
+const total = weeks.reduce((n, w) => n + w.checklist.length, 0);
+const label = (id: string, title: string) => `${Number(id.slice(1))}주차 · ${title}`;
+---
+<div class="aac-dash not-content" data-total={total}>
+  <div class="aac-dash-summary">
+    <div>
+      <div class="aac-big"><span id="aac-pct">0</span>%</div>
+      <div class="aac-hint">전체 진도 (<span id="aac-done">0</span> / {total} 항목)</div>
+    </div>
+    <div class="aac-next">
+      <div class="aac-hint">다음에 할 주차</div>
+      <a id="aac-next-link" href={href(weeks[0].slug)}>{label(weeks[0].id, weeks[0].title)}</a>
+    </div>
+  </div>
+  <div class="aac-bar aac-bar-lg"><span id="aac-total-bar" style="width:0%"></span></div>
+
+  {phases.map((p) => (
+    <section class="aac-phase">
+      <h3>Phase {p.id} · {p.title} <small>{p.weeks}</small></h3>
+      <p class="aac-hint">완료 기준: {p.goal}</p>
+      <ul class="aac-weeks">
+        {weeks.filter((w) => w.phase === p.id).map((w) => (
+          <li data-week={w.id} data-n={w.checklist.length} data-href={href(w.slug)} data-title={label(w.id, w.title)}>
+            <a href={href(w.slug)}>{label(w.id, w.title)}</a>
+            <span class="aac-wk-count">0 / {w.checklist.length}</span>
+            <div class="aac-bar"><span style="width:0%"></span></div>
+          </li>
+        ))}
+      </ul>
+    </section>
+  ))}
+
+  <section class="aac-phase">
+    <h3>백업과 이전</h3>
+    <p class="aac-hint">진도와 메모는 이 브라우저(localStorage)에만 저장됩니다. 다른 기기로 옮기거나 백업하려면 JSON으로 내보내세요.</p>
+    <div class="aac-actions">
+      <button type="button" id="aac-export">JSON 내보내기</button>
+      <label class="aac-btn">JSON 불러오기<input type="file" id="aac-import" accept="application/json" hidden /></label>
+      <button type="button" id="aac-reset" class="aac-danger">진도 초기화</button>
+    </div>
+    <p class="aac-hint" id="aac-msg" aria-live="polite"></p>
+  </section>
+</div>
+
+<script>
+  const KEY = 'aac:progress';
+  const read = (k: string) => { try { return localStorage.getItem(k); } catch { return null; } };
+  const write = (k: string, v: string) => { try { localStorage.setItem(k, v); return true; } catch { return false; } };
+  const root = document.querySelector<HTMLElement>('.aac-dash')!;
+  const msg = document.getElementById('aac-msg')!;
+
+  function render() {
+    let state: Record<string, number[]> = {};
+    try { state = JSON.parse(read(KEY) || '{}'); } catch {}
+    let done = 0;
+    let next: HTMLElement | undefined;
+    root.querySelectorAll<HTMLElement>('li[data-week]').forEach((li) => {
+      const n = Number(li.dataset.n);
+      const d = Math.min((state[li.dataset.week!] || []).length, n);
+      done += d;
+      li.querySelector('.aac-wk-count')!.textContent = `${d} / ${n}`;
+      li.querySelector<HTMLElement>('.aac-bar span')!.style.width = `${Math.round((d / n) * 100)}%`;
+      li.classList.toggle('aac-complete', d === n);
+      if (!next && d < n) next = li;
+    });
+    const total = Number(root.dataset.total);
+    document.getElementById('aac-pct')!.textContent = String(Math.round((done / total) * 100));
+    document.getElementById('aac-done')!.textContent = String(done);
+    document.getElementById('aac-total-bar')!.style.width = `${(done / total) * 100}%`;
+    const link = document.getElementById('aac-next-link') as HTMLAnchorElement;
+    if (next) {
+      link.href = next.dataset.href!;
+      link.textContent = next.dataset.title!;
+    } else {
+      link.removeAttribute('href');
+      link.textContent = '전 과정 완료! 포트폴리오와 면접 준비로 마무리하세요.';
+    }
+  }
+
+  document.getElementById('aac-export')!.addEventListener('click', () => {
+    const dump: Record<string, string> = {};
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i)!;
+        if (k.startsWith('aac:')) dump[k] = localStorage.getItem(k) || '';
+      }
+    } catch {
+      msg.textContent = '이 브라우저에서는 저장소에 접근할 수 없습니다.';
+      return;
+    }
+    const blob = new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `ai-agent-course-progress-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    msg.textContent = '내보냈습니다.';
+  });
+
+  document.getElementById('aac-import')!.addEventListener('change', async (e) => {
+    const file = (e.target as HTMLInputElement).files?.[0];
+    if (!file) return;
+    try {
+      const data = JSON.parse(await file.text());
+      let n = 0;
+      for (const [k, v] of Object.entries(data)) {
+        if (k.startsWith('aac:') && typeof v === 'string' && write(k, v)) n++;
+      }
+      msg.textContent = `${n}개 항목을 불러왔습니다.`;
+      render();
+    } catch {
+      msg.textContent = '올바른 JSON 파일이 아닙니다.';
+    }
+  });
+
+  const reset = document.getElementById('aac-reset')!;
+  let armed = false;
+  reset.addEventListener('click', () => {
+    if (!armed) {
+      armed = true;
+      reset.textContent = '한 번 더 누르면 초기화';
+      setTimeout(() => { armed = false; reset.textContent = '진도 초기화'; }, 3000);
+      return;
+    }
+    try { localStorage.removeItem(KEY); } catch {}
+    armed = false;
+    reset.textContent = '진도 초기화';
+    msg.textContent = '진도를 초기화했습니다. 메모는 유지됩니다.';
+    render();
+  });
+
+  render();
+</script>
