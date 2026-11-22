@@ -1,0 +1,175 @@
+---
+title: "20주차 · 서빙과 배포 인프라"
+description: vLLM으로 오픈소스 모델 서빙, PagedAttention과 continuous batching, 클라우드 배포, 인증·레이트 리밋·시크릿 관리를 다룹니다.
+sidebar:
+  order: 20
+  label: "20주차 · 서빙과 배포"
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Checklist from '../../../components/Checklist.astro';
+import Notes from '../../../components/Notes.astro';
+
+<Aside type="note" title="원본 강의">
+Part04 vLLM으로 폐쇄망 오픈소스 LLM API 서빙(Llama, Mistral 등). Part05 FastAPI + Streamlit 배포, Orchestrator + Sub-agents 연동.
+</Aside>
+
+## 학습 목표
+
+- 상용 API와 자체 서빙의 트레이드오프를 설명한다
+- vLLM으로 OpenAI 호환 서버를 띄우고 처리량·지연을 측정한다
+- LLM 추론 최적화의 핵심 개념(KV 캐시, PagedAttention, continuous batching, 양자화)을 안다
+- 에이전트 서비스를 클라우드에 배포하고 운영 기본기(인증, 레이트 리밋, 시크릿, 헬스체크)를 갖춘다
+
+## 상용 API vs 자체 서빙
+
+| | 상용 API | 자체 서빙 (vLLM 등) |
+| --- | --- | --- |
+| 품질 | 최상위 모델 사용 가능 | 오픈 모델 한정 (격차는 줄고 있음) |
+| 초기 비용 | 없음 | GPU, 운영 인력 |
+| 단가 | 토큰당 과금 | 사용량 많고 일정하면 유리 |
+| 데이터 | 외부 전송 (계약으로 보호) | 내부에 머묾 (폐쇄망, 규제 산업) |
+| 운영 | 공급자 책임 | 스케일링·장애 대응 직접 |
+| 커스터마이징 | 제한적 | 파인튜닝 모델, 특수 디코딩 |
+
+LangChain 조사에서 약 3분의 1의 조직이 자체 오픈소스 모델 배포에 투자하고 있다고 답했습니다. 한국에서는 금융·공공·제조 등 **폐쇄망 요구**가 큰 이유이고, 원본 강의가 vLLM을 다루는 이유이기도 합니다.
+
+## 핵심 개념
+
+### 1. LLM 추론의 두 단계
+
+- **Prefill:** 입력 토큰 전체를 한 번에 처리해 KV 캐시를 만든다. 연산 집약적(compute-bound). TTFT를 결정.
+- **Decode:** 토큰을 하나씩 생성. 매 토큰마다 KV 캐시 전체를 읽으므로 메모리 대역폭 집약적(memory-bound). TPOT를 결정.
+
+### 2. KV 캐시와 PagedAttention
+
+생성 중에는 이전 토큰들의 Key·Value를 저장해 재계산을 피합니다(KV 캐시). 요청이 많고 길수록 GPU 메모리의 대부분을 KV 캐시가 차지합니다. 기존 방식은 요청마다 최대 길이만큼 연속 메모리를 미리 잡아 낭비가 컸습니다. **PagedAttention**(vLLM의 핵심 아이디어)은 OS의 가상 메모리처럼 KV 캐시를 작은 블록으로 나눠 필요한 만큼만 할당해, 같은 GPU에서 훨씬 많은 요청을 동시에 처리합니다. 같은 접두사를 가진 요청끼리 블록을 공유하는 **prefix caching**도 가능합니다. 상용 API의 프롬프트 캐싱과 같은 원리입니다.
+
+### 3. Continuous batching
+
+정적 배치는 배치 안의 가장 긴 요청이 끝날 때까지 다른 요청이 기다립니다. Continuous(in-flight) batching은 **토큰 단위로** 끝난 요청을 빼고 새 요청을 넣어 GPU를 계속 채웁니다. 처리량이 크게 늘어납니다.
+
+### 4. 양자화와 그 밖의 기법
+
+- **양자화:** 가중치를 FP16 → FP8/INT8/INT4로 줄여 메모리와 속도를 개선. 품질 하락은 작업별로 평가해야 합니다(AWQ, GPTQ, FP8).
+- **텐서 병렬:** 모델 하나를 여러 GPU에 나눠 올림(`--tensor-parallel-size`).
+- **추측 디코딩(speculative decoding):** 작은 초안 모델이 여러 토큰을 제안하고 큰 모델이 한 번에 검증해 디코딩을 빠르게.
+- **구조화 출력:** vLLM은 JSON Schema 등으로 디코딩을 제약하는 guided decoding을 지원해 도구 호출 안정성을 높입니다.
+
+### 5. vLLM 서버 띄우기
+
+```bash
+# GPU 머신에서
+docker run --gpus all -p 8000:8000 --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  vllm/vllm-openai:latest \
+  --model Qwen/Qwen3-8B \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.9 \
+  --enable-prefix-caching \
+  --enable-auto-tool-choice --tool-call-parser hermes
+```
+
+```python
+from openai import OpenAI
+c = OpenAI(base_url="http://gpu-host:8000/v1", api_key="local")
+r = c.chat.completions.create(model="Qwen/Qwen3-8B", messages=[{"role": "user", "content": "안녕"}])
+```
+
+OpenAI 호환이므로 19주차 LiteLLM에 `local` 모델로 추가하면 에이전트 코드를 바꾸지 않고 라우팅할 수 있습니다. 도구 호출 파서(`--tool-call-parser`)는 모델 계열에 맞춰야 합니다. 모델 이름과 옵션은 vLLM 문서의 지원 모델 목록에서 확인하세요.
+
+<Aside type="tip" title="GPU가 없다면">
+클라우드 GPU를 시간 단위로 빌리거나(RunPod, Lambda, Modal 등) 무료 노트북의 GPU로 작은 모델을 실험하세요. 개념 실습만이라면 CPU에서 Ollama로 OpenAI 호환 서버를 띄워 같은 코드를 시험할 수 있습니다.
+</Aside>
+
+### 6. 측정해야 할 서빙 지표
+
+- **TTFT, TPOT, 엔드투엔드 지연**의 p50/p95
+- **처리량:** 초당 출력 토큰, 초당 요청
+- **동시 요청 수에 따른 변화:** 동시성 1, 8, 32, 64에서 지연·처리량 곡선을 그리면 서버의 한계 지점이 보입니다.
+- **GPU 메모리·사용률**, KV 캐시 사용률, 대기열 길이
+
+## 애플리케이션 배포
+
+### 배포 대상 선택
+
+| 선택지 | 적합 |
+| --- | --- |
+| 컨테이너 PaaS (Cloud Run, Fly.io, Render, Railway) | 포트폴리오, 소규모 서비스. 가장 빠름 |
+| 쿠버네티스 | 사내 표준이 k8s인 회사, 대규모 |
+| 서버리스 함수 | 짧은 요청만. 긴 스트리밍·장기 작업에는 시간 제한이 걸림 |
+| 관리형 에이전트 런타임 (AWS Bedrock AgentCore, Vertex AI Agent Engine 등) | 해당 클라우드를 쓰는 조직, 세션·메모리·관측을 관리형으로 |
+
+포트폴리오는 컨테이너 PaaS 하나에 배포하고, 면접에서 "k8s라면 이렇게 바꾸겠다"를 설명할 수 있으면 충분합니다.
+
+### 운영 체크리스트
+
+- [ ] 시크릿은 플랫폼 시크릿 관리자에(이미지·저장소에 없음)
+- [ ] `/healthz`(살아있음), `/readyz`(DB·LLM 게이트웨이 연결됨) 분리
+- [ ] 인증(API 키, OAuth/OIDC), 사용자별 레이트 리밋(Redis 토큰 버킷)
+- [ ] 요청 타임아웃과 스트리밍용 프록시 설정(버퍼링 해제, 긴 idle timeout)
+- [ ] 구조화 로그 + 트레이스 ID 전파(15주차)
+- [ ] 비용 예산 알림
+- [ ] 롤백 방법(이전 이미지 태그)
+- [ ] CORS, HTTPS, 보안 헤더
+
+## 심화
+
+### 오픈 모델을 에이전트에 쓸 때의 현실
+
+오픈 모델은 단발 질의응답은 잘해도 **긴 다단계 도구 사용**에서 상용 최상위 모델과 격차가 남아 있는 경우가 많습니다. 실무 패턴은 하이브리드입니다. 민감 데이터를 다루는 단계(문서 요약, PII가 있는 추출)는 내부 모델로, 데이터가 나가도 되는 어려운 계획 단계는 상용 모델로 보냅니다. 폐쇄망이라면 작업을 더 작은 단계로 쪼개고(워크플로우화), 구조화 디코딩과 검증을 강화합니다.
+
+### 용량 산정 감각
+
+7~8B 모델은 FP16 기준 가중치만 약 16GB입니다. 24GB GPU에서는 KV 캐시에 쓸 수 있는 공간이 작아 동시 요청과 컨텍스트 길이가 제한됩니다. 양자화하거나, 더 큰 GPU를 쓰거나, `max-model-len`을 줄입니다. 면접에서 "모델 크기 × 정밀도 바이트 + KV 캐시"로 대략 계산할 수 있으면 좋습니다.
+
+## 실습 과제
+
+`infra/` + `weeks/w20_serving/`
+
+**A. 서빙**
+
+1. vLLM(GPU) 또는 Ollama(CPU)로 오픈 모델 하나를 OpenAI 호환으로 띄운다.
+2. 부하 테스트 스크립트(asyncio + httpx)로 동시성 1/8/32에서 TTFT·TPOT·처리량을 측정해 그래프로 그린다.
+3. LiteLLM에 `local`로 추가하고, 6주차 RAG의 "청크 문맥 생성" 단계를 로컬 모델로 돌려 상용 모델 대비 품질·비용을 비교한다.
+
+**B. 배포**
+
+1. 포트폴리오 프로젝트 1 또는 2를 컨테이너 PaaS에 배포한다(백엔드 FastAPI + 간단한 웹 프론트).
+2. 위 운영 체크리스트를 모두 적용한다.
+3. 공개 URL에서 SSE 스트리밍이 끊김 없이 동작하는지 확인한다.
+
+**채점 기준**
+
+- [ ] 동시성별 지연·처리량 그래프가 있다
+- [ ] 공개 URL이 있고, 인증 없이는 API를 호출할 수 없다
+- [ ] 배포 환경에서 스트리밍이 토큰 단위로 나온다
+
+## 면접 질문
+
+<details>
+<summary>vLLM이 빠른 이유는 무엇인가요?</summary>
+
+핵심은 PagedAttention과 continuous batching입니다. PagedAttention은 KV 캐시를 고정 크기 블록으로 나눠 필요한 만큼만 할당하고 접두사가 같은 요청끼리 공유해 메모리 낭비를 크게 줄이므로, 같은 GPU에서 더 많은 요청을 동시에 처리합니다. Continuous batching은 토큰 단위로 끝난 요청을 빼고 새 요청을 넣어 GPU를 쉬지 않게 합니다. 여기에 최적화된 커널, 양자화, 텐서 병렬, 추측 디코딩, prefix caching 지원이 더해집니다.
+</details>
+
+<details>
+<summary>TTFT와 TPOT은 무엇이고, 각각 무엇이 영향을 주나요?</summary>
+
+TTFT는 요청 후 첫 토큰이 나오기까지의 시간으로, 입력 길이(prefill 연산량), 대기열, 캐시 적중 여부가 영향을 줍니다. TPOT는 이후 토큰 하나당 생성 시간으로, 모델 크기, 메모리 대역폭, 동시 배치 크기, 양자화가 영향을 줍니다. 채팅 UX는 TTFT가, 긴 출력 작업은 TPOT가 중요하고, 에이전트는 턴이 많아 TTFT가 누적되므로 캐싱과 입력 길이 관리가 특히 중요합니다.
+</details>
+
+<details>
+<summary>폐쇄망 환경에서 에이전트를 만들어야 한다면?</summary>
+
+vLLM 같은 서버로 오픈 모델을 내부에 서빙하고 OpenAI 호환 게이트웨이 뒤에 둡니다. 오픈 모델은 긴 다단계 도구 사용이 상대적으로 약하므로, 작업을 명확한 단계로 쪼개 워크플로우 비중을 높이고, 구조화 디코딩·스키마 검증·재시도를 강화하며, 도구 수를 줄이고 설명을 정교하게 씁니다. 임베딩·리랭커·관측 도구도 내부에 배포해야 하고, 모델·패키지의 공급망 검증과 오프라인 업데이트 절차가 필요합니다. 평가 세트로 상용 모델 대비 격차를 측정해 기대치를 관리합니다.
+</details>
+
+## 더 읽기
+
+- [vLLM 문서](https://docs.vllm.ai/)
+- [PagedAttention 논문 (Kwon et al., 2023)](https://arxiv.org/abs/2309.06180)
+- [Hugging Face: LLM inference optimization](https://huggingface.co/docs/transformers/llm_optims)
+
+<Checklist week="w20" />
+<Notes week="w20" />

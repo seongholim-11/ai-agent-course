@@ -1,0 +1,161 @@
+---
+title: "15주차 · 관측(Observability)과 트레이싱"
+description: trace·span 모델, Langfuse·LangSmith 연동, OpenTelemetry GenAI 규칙, 비용·지연·실패 대시보드, 병목 분석을 다룹니다.
+sidebar:
+  order: 15
+  label: "15주차 · 관측과 트레이싱"
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Checklist from '../../../components/Checklist.astro';
+import Notes from '../../../components/Notes.astro';
+
+<Aside type="note" title="원본 강의">
+Part05 실전 프로젝트: LiteLLM, Langfuse 멀티 에이전트 개발 환경, Trace·Log·Cost 모니터링, 병목 탐지.
+</Aside>
+
+## 학습 목표
+
+- 에이전트 관측이 일반 서비스 모니터링과 다른 점을 설명한다
+- trace, span, generation, session 개념으로 에이전트 실행을 기록한다
+- Langfuse(또는 LangSmith)를 붙이고 OpenTelemetry GenAI 규칙을 이해한다
+- 트레이스로 가장 느린 단계, 가장 비싼 단계, 가장 자주 실패하는 단계를 찾는다
+
+## 왜 에이전트에는 특별한 관측이 필요한가
+
+일반 서비스는 "요청 → 응답, 상태 코드, 지연"으로 충분합니다. 에이전트는 **같은 요청도 매번 다른 경로**로 실행되고, HTTP 200이어도 답이 틀릴 수 있습니다. "왜 이 답이 나왔나"를 보려면 각 LLM 호출의 입력·출력, 도구 호출과 결과, 의사결정 순서가 다 필요합니다. LangChain 조사에서 프로덕션 에이전트를 운영하는 팀의 94%가 관측 도구를 쓰고 71.5%가 상세 트레이싱을 한다고 답했습니다. 사실상 필수입니다.
+
+## 핵심 개념
+
+### 1. 데이터 모델
+
+```
+Session (사용자 대화 전체, session_id)
+└─ Trace (요청 하나: "환불해줘")                        8.2s  $0.012
+   ├─ Span: classify                                   0.6s
+   │   └─ Generation: claude-haiku (in 820 / out 12)    0.6s  $0.0009
+   ├─ Span: agent_loop
+   │   ├─ Generation: turn 1 (tool_use: get_order)     1.1s
+   │   ├─ Span: tool get_order                         0.3s
+   │   ├─ Generation: turn 2 (tool_use: check_policy)  1.4s
+   │   ├─ Span: tool check_policy                      2.9s  ← 병목
+   │   └─ Generation: turn 3 (final)                   1.9s
+   └─ Score: judge.accuracy = PASS, user_feedback = 👍
+```
+
+- **Generation**은 LLM 호출로, 모델명, 입력·출력, 토큰, 비용, TTFT를 담습니다.
+- **Span**은 도구 실행이나 단계처럼 시간이 있는 작업 단위입니다.
+- **Score**는 트레이스에 붙는 평가 결과입니다(자동 judge, 사용자 피드백, 사람 라벨).
+- **메타데이터**로 user_id, 버전(프롬프트·모델·코드), 환경, 실험 ID를 꼭 붙입니다. 나중에 "버전 B부터 비용이 늘었다"를 찾으려면 필요합니다.
+
+### 2. Langfuse 붙이기
+
+```python
+from langfuse import observe, get_client
+
+langfuse = get_client()
+
+@observe()                      # 함수가 span이 된다
+async def get_order(order_id: str): ...
+
+@observe(as_type="generation")
+async def call_llm(messages, model):
+    resp = await client.messages.create(model=model, messages=messages, max_tokens=1024)
+    langfuse.update_current_generation(
+        model=model, input=messages, output=resp.content,
+        usage_details={"input": resp.usage.input_tokens, "output": resp.usage.output_tokens},
+    )
+    return resp
+
+@observe()
+async def handle(user_id: str, session_id: str, msg: str):
+    langfuse.update_current_trace(user_id=user_id, session_id=session_id,
+                                  tags=["refund"], metadata={"prompt_version": "v3", "git_sha": GIT_SHA})
+    ...
+```
+
+LangGraph·LangChain은 콜백 핸들러 하나로, OpenAI·Anthropic SDK는 계측 래퍼로 자동 기록할 수 있습니다. 자체 호스팅은 docker compose로 띄웁니다.
+
+### 3. OpenTelemetry GenAI 규칙
+
+OpenTelemetry에는 생성형 AI용 시맨틱 규칙(semantic conventions)이 있어 `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.operation.name`(chat, execute_tool, invoke_agent) 같은 표준 속성 이름을 정의합니다. 이 규칙을 따르면 Langfuse, Datadog, Grafana 등 어느 백엔드로도 같은 데이터를 보낼 수 있어 **벤더 종속을 피할 수** 있습니다. 회사에 이미 OTel 기반 모니터링이 있다면 에이전트 트레이스를 같은 파이프라인에 태우는 것이 운영상 유리합니다.
+
+### 4. 대시보드에 둘 것
+
+| 범주 | 지표 |
+| --- | --- |
+| 비용 | 요청당 비용 p50/p95, 일 총비용, 모델별·기능별 비용, 캐시 적중률 |
+| 지연 | 엔드투엔드 p50/p95/p99, TTFT, 턴 수 분포, 도구별 지연 |
+| 신뢰성 | 에러율(LLM API, 도구), 재시도율, 타임아웃, 최대 턴 도달 비율 |
+| 품질 | 온라인 judge 점수 추이, 사용자 피드백, 거절률, 사람 이관률 |
+| 행동 | 도구 호출 빈도, 반복 루프 감지 수, 평균 컨텍스트 길이 |
+
+p50만 보면 안 됩니다. 에이전트는 **긴 꼬리**가 심해서 p95가 p50의 5~10배인 경우가 흔하고, 비용 폭주도 꼬리에서 일어납니다.
+
+## 심화
+
+### 트레이스로 병목 찾기
+
+1. 지연 상위 5% 트레이스를 모은다.
+2. 각 트레이스에서 시간을 가장 많이 쓴 span을 집계한다.
+3. 흔한 원인: 순차로 부른 독립 도구(→ 병렬화), 느린 외부 API(→ 캐시, 타임아웃), 불필요한 턴(→ 프롬프트·도구 설계), 너무 긴 컨텍스트로 인한 TTFT 증가(→ 11주차), 큰 모델을 써도 될 필요가 없는 단계(→ 19주차 라우팅).
+
+### 개인정보와 로그
+
+트레이스에는 사용자 입력과 도구 결과(고객 정보)가 그대로 담깁니다. 마스킹(이메일, 전화번호, 주민번호 패턴), 보존 기간, 접근 권한, 샘플링(전수 기록 대신 일부만) 정책을 정해야 합니다. 관측 도구에 데이터를 보내는 것 자체가 개인정보 처리 위탁일 수 있습니다.
+
+### 샘플링 전략
+
+트래픽이 많으면 모든 트레이스를 저장하기 비쌉니다. **에러·느린 요청·낮은 점수·부정 피드백은 100%**, 나머지는 일정 비율로 샘플링합니다(tail-based sampling).
+
+### 관측에서 평가로
+
+관측 데이터는 16주차 개선 루프의 원료입니다. 부정 피드백이나 낮은 judge 점수가 붙은 트레이스를 모아 사람이 검토하고, 대표 사례를 평가 세트에 추가합니다. 관측 도구 대부분이 이 "트레이스 → 데이터셋" 기능을 제공합니다.
+
+## 실습 과제
+
+`weeks/w15_observability/`
+
+**요구사항**
+
+1. Langfuse를 docker compose로 자체 호스팅(또는 클라우드 무료 플랜)한다.
+2. 7주차 환불 에이전트 또는 8주차 리서치 에이전트 전체를 계측한다: 모든 LLM 호출, 도구 호출, 노드에 span. user_id, session_id, 버전 메타데이터.
+3. 이메일·전화번호 마스킹을 트레이스 전송 전에 적용한다.
+4. 14주차 평가 세트 50개를 돌려 트레이스를 쌓고, 비용·지연·도구 사용 대시보드를 만든다.
+5. 트레이스 분석으로 가장 느린 단계를 찾아 개선하고(병렬화, 타임아웃, 캐시 등) 전후 p95를 비교한다.
+6. 평가 세트 judge 점수를 트레이스에 Score로 붙인다.
+
+**채점 기준**
+
+- [ ] 트레이스 하나를 열면 모든 도구 호출의 입력·출력·지연이 보인다
+- [ ] 마스킹이 적용되어 원본 이메일이 트레이스에 없다
+- [ ] 개선 전후 p95 지연 비교가 있다
+
+## 면접 질문
+
+<details>
+<summary>프로덕션 에이전트에서 무엇을 모니터링하나요?</summary>
+
+비용(요청당 p50·p95, 모델·기능별, 캐시 적중률), 지연(엔드투엔드 p50·p95·p99, TTFT, 턴 수, 도구별), 신뢰성(LLM·도구 에러율, 재시도, 타임아웃, 최대 턴 도달), 품질(온라인 judge 점수, 사용자 피드백, 거절률, 사람 이관률), 행동(도구 호출 패턴, 반복 루프, 컨텍스트 길이)입니다. 이를 트레이스 단위로 기록해 개별 실패를 추적할 수 있어야 하고, 프롬프트·모델·코드 버전을 메타데이터로 붙여 변경의 영향을 볼 수 있어야 합니다.
+</details>
+
+<details>
+<summary>에이전트가 이상한 답을 했다는 신고가 오면 어떻게 조사하나요?</summary>
+
+해당 요청의 트레이스를 찾아 각 단계의 입력과 출력을 따라갑니다. 검색이나 도구가 잘못된 정보를 줬는지, 모델이 올바른 정보를 받고도 잘못 해석했는지, 도구를 잘못된 인자로 불렀는지, 컨텍스트가 너무 길어 지시를 놓쳤는지를 구분합니다. 원인을 분류한 뒤 같은 유형의 다른 트레이스가 있는지 검색해 빈도를 확인하고, 사례를 평가 세트에 추가한 뒤 수정하고 회귀 테스트를 돌립니다.
+</details>
+
+<details>
+<summary>OpenTelemetry를 에이전트 관측에 쓰는 이점은?</summary>
+
+GenAI 시맨틱 규칙으로 모델, 토큰, 도구 실행, 에이전트 호출 같은 속성 이름이 표준화되어 있어, 특정 관측 벤더에 종속되지 않고 여러 백엔드로 같은 데이터를 보낼 수 있습니다. 또한 기존 서비스의 분산 트레이싱과 같은 트레이스 ID로 연결되어, 에이전트 호출이 하위 마이크로서비스·DB까지 어떻게 이어지는지 한 화면에서 볼 수 있습니다.
+</details>
+
+## 더 읽기
+
+- [Langfuse 문서](https://langfuse.com/docs)
+- [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
+- [LangSmith 문서](https://docs.langchain.com/langsmith/home)
+
+<Checklist week="w15" />
+<Notes week="w15" />

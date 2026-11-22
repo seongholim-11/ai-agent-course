@@ -1,0 +1,223 @@
+---
+title: "12주차 · Deep Agent와 Skills, 하네스 설계"
+description: Claude Code형 에이전트 하네스의 구성 요소, 계획·파일 도구, 서브에이전트, Skills와 점진적 공개를 다룹니다.
+sidebar:
+  order: 12
+  label: "12주차 · Deep Agent와 Skills"
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Checklist from '../../../components/Checklist.astro';
+import Notes from '../../../components/Notes.astro';
+
+<Aside type="note" title="원본 강의">
+Part04 AI Agent 심화 프로젝트: DeepAgent 구현(Claude Code 같은 구조, 파일시스템 컨텍스트, 서브에이전트), LangGraph 1.0 Deepagent 간단 구현. Skills와 하네스 설계는 보강 내용입니다.
+</Aside>
+
+## 학습 목표
+
+- "얕은" 에이전트와 "깊은" 에이전트(Deep Agent)의 차이를 설명한다
+- 하네스(harness)의 구성 요소를 나열하고 각각이 왜 필요한지 안다
+- 계획 도구, 파일 도구, 서브에이전트를 가진 Deep Agent를 만든다
+- Skill을 설계하고 점진적 공개(progressive disclosure)로 컨텍스트를 아낀다
+
+## Deep Agent란
+
+4주차의 단순 루프는 몇 턴짜리 작업은 잘하지만, 수십~수백 턴짜리 작업(코드베이스 리팩터링, 심층 리서치, 보고서 작성)에서는 목표를 잊고 헤맵니다. Claude Code, Codex, Manus, Deep Research 같은 시스템은 같은 루프 위에 네 가지를 더해 이 문제를 풉니다. LangChain은 이 공통 구조를 "Deep Agents"라는 이름으로 정리했습니다.
+
+1. **계획 도구:** todo 리스트를 쓰고 갱신하며 진행 상황을 추적
+2. **파일시스템:** 노트·중간 결과·산출물을 파일로 (11주차 Write 전략)
+3. **서브에이전트:** 하위 작업을 격리된 컨텍스트에 위임 (11주차 Isolate 전략)
+4. **상세한 시스템 프롬프트:** 도구 사용법, 작업 방식, 예시를 길고 구체적으로
+
+## 하네스: 모델 바깥의 모든 것
+
+2026년 AI Engineer World's Fair의 주요 화두는 **harness engineering**과 **loop engineering**이었습니다. 같은 모델이라도 하네스에 따라 성능이 크게 달라지기 때문입니다. 하네스는 다음을 포함합니다.
+
+| 구성 요소 | 역할 | 예 |
+| --- | --- | --- |
+| 루프 | 모델 호출 → 도구 실행 → 반복, 종료 판단 | 최대 턴, 진전 감지 |
+| 도구 세트 | 행동 공간 정의 | read/write/edit/grep/bash, 웹 |
+| 컨텍스트 관리 | 무엇을 보여줄지 | 결과 절단, compaction, 노트 |
+| 계획 | 장기 목표 유지 | todo 도구 |
+| 위임 | 하위 작업 격리 | 서브에이전트 |
+| 권한·안전 | 위험 행동 통제 | 승인 모드, 샌드박스, 허용 목록 |
+| 확장 | 능력 추가 | Skills, MCP, 훅(hook) |
+| 검증 | 결과 확인 | 테스트 실행, 린터, 자기 검토 |
+| 관측 | 무슨 일이 있었나 | 트레이스, 비용 |
+
+**Inner loop vs outer loop:** 안쪽 루프는 한 번의 작업 실행(도구 호출 반복)이고, 바깥 루프는 그 결과를 검증하고 실패하면 다시 돌리거나 사람에게 넘기는 상위 제어입니다(예: "테스트가 통과할 때까지 에이전트 재실행, 최대 3회"). 자율성을 어디까지 줄지는 바깥 루프의 검증 장치가 얼마나 믿을 만한지에 달려 있습니다.
+
+## 핵심 구현
+
+### 1. 계획 도구 (todo)
+
+```python
+class Todo(BaseModel):
+    content: str
+    status: Literal["pending", "in_progress", "completed"]
+
+WRITE_TODOS = {
+  "name": "write_todos",
+  "description": ("작업 계획을 todo 리스트로 작성·갱신한다. 3단계 이상의 작업이면 시작할 때 반드시 작성한다. "
+                  "한 번에 하나만 in_progress로 두고, 끝나면 즉시 completed로 바꾼다. 새로 알게 된 일은 추가한다."),
+  "input_schema": {"type": "object", "properties": {"todos": {"type": "array", "items": Todo.model_json_schema()}}}
+}
+```
+
+이 도구는 아무 일도 "실행"하지 않습니다. 그런데도 효과가 큰 이유는 **계획이 매 턴 컨텍스트 최근 위치에 다시 나타나** 모델이 목표를 잊지 않게 하고, 사용자에게 진행 상황을 보여주기 때문입니다.
+
+### 2. 파일 도구
+
+`ls`, `read_file(path, offset, limit)`, `write_file`, `edit_file(path, old, new)`, `glob`, `grep`. 편집은 파일 전체를 다시 쓰는 것보다 **정확한 문자열 치환**이 토큰을 덜 쓰고 실수가 적습니다. 경로는 작업 디렉터리 안으로 제한합니다.
+
+### 3. 서브에이전트 도구
+
+```python
+TASK_TOOL = {
+  "name": "task",
+  "description": ("독립적인 하위 작업을 새 서브에이전트에게 맡긴다. 많은 파일을 읽거나 검색해야 하는 조사에 사용한다. "
+                  "서브에이전트는 너의 대화를 모르므로 목적·범위·출력 형식을 브리프에 모두 적어라. 독립적인 작업은 동시에 여러 개 호출하라."),
+  "input_schema": {"type": "object", "properties": {
+      "description": {"type": "string"}, "brief": {"type": "string"},
+      "subagent_type": {"type": "string", "enum": ["researcher", "code-reviewer", "general"]}}}
+}
+```
+
+### 4. 프레임워크로 만들기
+
+```python
+# LangGraph Deep Agents
+from deepagents import create_deep_agent
+
+agent = create_deep_agent(
+    tools=[web_search],
+    system_prompt="너는 기술 리서치 전문가다. ...",
+    subagents=[{"name": "researcher", "description": "한 주제를 깊게 조사", "system_prompt": "...", "tools": [web_search]}],
+)
+```
+
+```python
+# Claude Agent SDK: Claude Code의 하네스를 라이브러리로 사용
+from claude_agent_sdk import query, ClaudeAgentOptions
+
+async for msg in query(
+    prompt="이 저장소의 인증 흐름을 분석해 docs/auth.md로 정리해줘",
+    options=ClaudeAgentOptions(allowed_tools=["Read", "Grep", "Glob", "Write"], permission_mode="acceptEdits", cwd="./repo"),
+):
+    print(msg)
+```
+
+두 SDK의 API는 버전마다 바뀌므로 공식 문서를 기준으로 하세요. 중요한 것은 이 SDK들이 **위의 네 가지 구성 요소를 기본 제공한다**는 점을 이해하고, 필요할 때 직접 만들 수 있는 것입니다.
+
+## Skills
+
+### Skill이란
+
+Skill은 **특정 작업을 잘하는 방법을 담은 폴더**입니다. `SKILL.md`(이름, 언제 쓰는지 설명, 절차)와 선택적인 스크립트·템플릿·참고 문서로 구성됩니다. Anthropic이 2025년 10월 Claude에 도입한 뒤 여러 에이전트 도구가 같은 형식을 지원하며 빠르게 확산되었습니다.
+
+```
+skills/
+  korean-report/
+    SKILL.md          ← 이름 + 설명(항상 로드) + 본문(필요할 때 로드)
+    template.md
+    scripts/
+      check_citations.py
+```
+
+```markdown
+---
+name: korean-report
+description: 한국어 기술 보고서를 작성할 때 사용. 목차 구성, 문체 규칙, 인용 형식, 최종 검증 절차를 담는다.
+---
+
+# 한국어 기술 보고서 작성
+
+1. template.md의 목차 구조를 따른다.
+2. 문장은 "~다" 체, 한 문장 40자 내외.
+3. 모든 수치에는 [n] 형식 인용을 단다.
+4. 완성 후 `python scripts/check_citations.py report.md`로 인용 누락을 검사하고, 누락이 있으면 고친다.
+```
+
+### 점진적 공개(Progressive disclosure)
+
+1. **항상:** 모든 Skill의 이름과 설명(각 수십 토큰)만 시스템 프롬프트에 있습니다.
+2. **필요할 때:** 모델이 작업에 맞는 Skill을 고르면 `SKILL.md` 본문을 읽습니다.
+3. **더 필요할 때:** 본문이 가리키는 참고 문서·스크립트를 그때 읽거나 실행합니다.
+
+수십 개의 Skill을 설치해도 평소에는 컨텍스트를 거의 쓰지 않습니다. MCP 서버 수십 개의 도구 정의를 항상 싣는 것과 대조적입니다.
+
+### Skill vs 도구 vs 서브에이전트 vs 시스템 프롬프트
+
+| 수단 | 담는 것 | 적합 |
+| --- | --- | --- |
+| 시스템 프롬프트 | 항상 필요한 정체성·원칙 | 모든 작업에 적용되는 규칙 |
+| 도구(MCP 포함) | 외부 세계와의 상호작용 | API 호출, 데이터 조회 |
+| Skill | 절차적 지식(어떻게 하는가) + 보조 스크립트 | 반복되는 전문 작업, 조직의 노하우 |
+| 서브에이전트 | 격리된 실행 | 컨텍스트를 많이 먹는 하위 작업 |
+
+"Skills가 오케스트레이션 코드를 줄인다"는 주장의 요지는, 복잡한 분기를 그래프로 짜는 대신 **좋은 절차 문서와 스크립트를 주고 모델이 따르게** 할 수 있는 영역이 넓어졌다는 것입니다. 동시에 Skill을 너무 많이, 너무 크게 만들면 선택 정확도가 떨어지므로 **작고 적게** 만드는 것이 권장됩니다.
+
+## 심화: 하네스 품질을 올리는 장치
+
+- **검증 루프:** 코드 작업이면 테스트·타입체크·린터를 도구로 주고 "완료 전 반드시 실행"을 규칙으로.
+- **훅(hook):** 특정 도구 호출 전후에 코드를 실행(예: 파일 저장 후 자동 포맷, 위험 명령 차단). 모델의 판단이 아닌 **결정적 통제**입니다.
+- **권한 모드:** 읽기는 자동, 쓰기는 확인, 위험 명령은 차단처럼 단계화.
+- **프로젝트 메모리 파일:** `CLAUDE.md`·`AGENTS.md`처럼 저장소의 관례와 명령을 담은 파일을 시작 시 로드.
+- **재현 가능한 실행:** 같은 작업을 같은 하네스로 다시 돌릴 수 있게 입력·설정·도구 버전을 기록.
+
+## 실습 과제: 코드베이스 질의 Deep Agent
+
+`weeks/w12_deep_agent/`
+
+**요구사항**
+
+1. 직접 구현 또는 Deep Agents/Claude Agent SDK로, `write_todos`, 파일 도구 6종, `task`(서브에이전트) 도구를 갖춘 에이전트를 만든다.
+2. 대상: 중간 크기 오픈소스 저장소. 질문 예: "요청이 들어와 응답이 나갈 때까지의 흐름을 설명하고 관련 파일과 함수를 나열해라."
+3. Skill 2개를 만든다: `architecture-doc`(아키텍처 문서 형식과 다이어그램 규칙), `code-citation`(파일:줄 형식 인용 규칙과 검증 스크립트).
+4. Skill을 로드했을 때와 안 했을 때 결과물의 형식 준수율을 비교한다.
+5. 바깥 루프: 인용 검증 스크립트가 실패하면 에이전트에게 오류를 주고 최대 2회 재실행.
+6. 질문 5개에 대해 4주차 단순 루프와 비교: 정확도(직접 검증), 턴 수, 토큰.
+
+**채점 기준**
+
+- [ ] todo 리스트가 작업 중 갱신되는 것이 트레이스에 보인다
+- [ ] 서브에이전트가 최소 1회 이상 병렬로 사용된다
+- [ ] Skill 본문은 필요할 때만 로드된다(로드 시점이 로그에 있다)
+- [ ] 단순 루프 대비 정확도 비교표가 있다
+
+## 면접 질문
+
+<details>
+<summary>Claude Code 같은 코딩 에이전트의 구조를 설명해보세요.</summary>
+
+핵심은 단순한 도구 루프이고, 그 위에 하네스가 얹혀 있습니다. 파일 읽기·편집·검색·셸 실행 도구, todo 기반 계획, 독립 컨텍스트의 서브에이전트, 오래된 결과 정리와 compaction 같은 컨텍스트 관리, 단계별 권한 모드와 훅, Skills·MCP 같은 확장, 테스트·린터로 결과를 확인하는 검증, 프로젝트 메모리 파일이 있습니다. 코드베이스 전체를 미리 넣지 않고 필요할 때 탐색하는 just-in-time 방식이 특징입니다.
+</details>
+
+<details>
+<summary>Skills와 MCP는 어떻게 다른가요?</summary>
+
+MCP는 외부 시스템에 접근하는 도구와 데이터를 표준화한 프로토콜이고, Skill은 작업을 수행하는 절차적 지식(지침, 템플릿, 스크립트)을 패키징한 것입니다. MCP 도구 정의는 연결되어 있는 동안 컨텍스트를 차지하는 반면, Skill은 이름과 설명만 항상 로드되고 본문은 필요할 때 읽혀 점진적 공개가 됩니다. 실무에서는 함께 씁니다. 예를 들어 "분기 보고서 작성" Skill이 절차를 담고, 그 안에서 MCP 도구로 데이터를 가져옵니다.
+</details>
+
+<details>
+<summary>todo 리스트 도구는 아무것도 실행하지 않는데 왜 효과가 있나요?</summary>
+
+긴 작업에서 모델은 초반 목표와 계획을 잊는 경향이 있습니다. todo 도구를 갱신할 때마다 전체 계획이 컨텍스트의 최근 위치에 다시 쓰여 주의를 받게 되고, 계획 수립 자체가 작업 분해를 유도하며, 완료 상태를 명시하면서 빠뜨린 단계를 알아챕니다. 또한 사용자와 관측 도구가 진행 상황을 볼 수 있습니다.
+</details>
+
+<details>
+<summary>하네스 엔지니어링이 왜 중요해졌나요?</summary>
+
+같은 모델이라도 도구 설계, 컨텍스트 관리, 계획·검증 장치, 권한 통제에 따라 작업 성공률과 비용이 크게 달라지기 때문입니다. 모델 성능이 상향 평준화되면서 차별화는 모델 바깥의 시스템에서 나오고, 프로덕션에서는 평가, 가드레일, 관측, 게이트웨이 같은 주변 시스템에 더 많은 시간이 듭니다. 에이전트 엔지니어의 핵심 역량이 "프롬프트 작성"에서 "루프와 하네스 설계"로 옮겨간 이유입니다.
+</details>
+
+## 더 읽기
+
+- [LangChain: Deep Agents](https://blog.langchain.com/deep-agents/)
+- [Anthropic: Equipping agents for the real world with Agent Skills](https://www.anthropic.com/engineering/equipping-agents-for-the-real-world-with-agent-skills)
+- [Claude Agent SDK 문서](https://docs.claude.com/en/docs/agent-sdk/overview)
+- [Latent Space: AIEWF 2026 트렌드](https://latent.space/p/aiewf26trends)
+
+<Checklist week="w12" />
+<Notes week="w12" />

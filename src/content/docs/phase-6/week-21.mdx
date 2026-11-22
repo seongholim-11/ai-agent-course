@@ -1,0 +1,183 @@
+---
+title: "21주차 · 장기 실행 에이전트와 신뢰성"
+description: 큐와 워커 기반 백그라운드 에이전트, durable execution, 재시도·타임아웃·멱등성, 부하 테스트로 운영 가능한 에이전트를 만듭니다.
+sidebar:
+  order: 21
+  label: "21주차 · 장기 실행과 신뢰성"
+---
+
+import { Aside } from '@astrojs/starlight/components';
+import Checklist from '../../../components/Checklist.astro';
+import Notes from '../../../components/Notes.astro';
+
+<Aside type="note" title="원본 강의">
+Part05 실전 프로젝트의 프로덕션 파트와 연결되지만, durable execution과 신뢰성 엔지니어링은 보강 내용입니다.
+</Aside>
+
+## 학습 목표
+
+- 분~시간 단위 에이전트 작업을 요청-응답이 아닌 작업(job) 모델로 설계한다
+- durable execution의 개념을 설명하고 LangGraph 체크포인트·Temporal과 비교한다
+- 재시도, 타임아웃, 멱등성, 보상(compensation)으로 부분 실패를 다룬다
+- 부하 테스트로 동시 처리 한계를 측정하고 병목을 찾는다
+
+## 왜 별도 주차인가
+
+데모 에이전트와 프로덕션 에이전트의 가장 큰 차이는 **실패했을 때 무슨 일이 일어나는가**입니다. LLM API는 수시로 429·529·타임아웃을 내고, 도구는 느려지고, 배포 중에 프로세스가 재시작되고, 사람 승인은 며칠 걸립니다. 30분짜리 작업이 25분째에 죽었을 때 처음부터 다시 하면 비용과 사용자 신뢰를 모두 잃습니다.
+
+## 핵심 개념
+
+### 1. 작업(job) 아키텍처
+
+```
+Client ──POST /jobs──▶ API ──enqueue──▶ Queue (Redis/SQS/Postgres) ──▶ Worker N개
+  │                     │                                              │
+  │◀── 202 {job_id} ────┘                                              ├─ 에이전트 실행
+  │                                                                    ├─ 체크포인트 저장 (Postgres)
+  └── GET /jobs/{id}/events (SSE, Last-Event-ID) ◀── 이벤트 스트림 ◀────┘   진행 이벤트 발행 (Redis Stream)
+```
+
+- API는 작업을 받고 즉시 반환합니다. 무거운 일은 워커가 합니다.
+- 진행 이벤트는 저장소에 쌓아두므로, 클라이언트가 끊겼다가 다시 붙어도 놓친 이벤트부터 받습니다.
+- 워커 수를 늘려 수평 확장합니다. 동시 실행 수는 LLM 레이트 리밋에 맞춰 제한합니다.
+- 작업 상태: `queued → running → (waiting_approval) → succeeded / failed / canceled`. 취소 API가 꼭 필요합니다.
+
+### 2. 실패의 분류
+
+| 실패 | 예 | 처리 |
+| --- | --- | --- |
+| 일시적 | 429, 529, 네트워크 끊김 | 지터 백오프 재시도 (1주차) |
+| 영구적 | 400 잘못된 요청, 권한 없음 | 재시도 없이 실패 처리, 모델에게 오류 전달 |
+| 논리적 | 에이전트가 목표 달성 실패 | 바깥 루프 재시도(다른 전략) 또는 사람에게 |
+| 인프라 | 워커 크래시, 배포 재시작 | 체크포인트에서 재개 |
+| 지연 | 도구가 끝없이 안 끝남 | 단계별 타임아웃, 전체 데드라인 |
+
+### 3. 멱등성
+
+재시도와 재개가 안전하려면 **같은 단계를 두 번 실행해도 결과가 한 번 실행한 것과 같아야** 합니다.
+
+```python
+async def execute_refund(order_id: str, amount: int, *, idem_key: str):
+    # idem_key = f"{job_id}:{step_id}" 처럼 결정적으로 생성
+    existing = await db.fetchrow("SELECT result FROM side_effects WHERE key=$1", idem_key)
+    if existing:
+        return existing["result"]                       # 이미 했으면 결과만 돌려줌
+    result = await payments.refund(order_id, amount, idempotency_key=idem_key)   # 외부 API도 키 지원 시 전달
+    await db.execute("INSERT INTO side_effects(key, result) VALUES($1, $2)", idem_key, result)
+    return result
+```
+
+LLM 호출 자체는 비결정적이라 다시 하면 다른 결과가 나옵니다. 그래서 durable execution 엔진은 **이미 끝난 단계의 결과를 기록해두고 재생(replay)할 때 재사용**합니다.
+
+### 4. Durable execution
+
+Durable execution은 "프로그램이 어디서 죽든, 마지막으로 완료된 단계부터 자동으로 이어서 실행된다"는 보장입니다.
+
+| | LangGraph 체크포인트 | Temporal (및 유사 엔진) |
+| --- | --- | --- |
+| 단위 | 그래프의 super-step | 워크플로우의 activity |
+| 재개 | 같은 thread로 다시 invoke | 엔진이 자동으로 재시도·재개 |
+| 타이머·대기 | interrupt 후 외부에서 resume | 내장 타이머, 신호(signal), 며칠짜리 대기 |
+| 재시도 정책 | 노드별 RetryPolicy | activity별 재시도·타임아웃·하트비트 |
+| 운영 | 저장소만 있으면 됨 | 별도 서버 클러스터(또는 관리형) |
+| 적합 | 에이전트 내부 흐름, 사람 승인 | 여러 시스템에 걸친 긴 비즈니스 프로세스 |
+
+```python
+# Temporal 스케치: LLM 호출과 도구 호출을 activity로
+@activity.defn
+async def llm_step(messages: list[dict]) -> dict: ...
+
+@activity.defn
+async def tool_step(name: str, args: dict, idem_key: str) -> str: ...
+
+@workflow.defn
+class ResearchWorkflow:
+    @workflow.run
+    async def run(self, task: str) -> str:
+        messages = [{"role": "user", "content": task}]
+        for turn in range(30):
+            resp = await workflow.execute_activity(llm_step, messages,
+                         start_to_close_timeout=timedelta(minutes=2),
+                         retry_policy=RetryPolicy(maximum_attempts=5))
+            ...   # 도구 호출도 activity로, 결과는 엔진이 기록
+```
+
+워크플로우 코드는 결정적이어야 하고(현재 시각, 난수, 직접 I/O 금지), 비결정적인 일은 모두 activity로 뺍니다. 워커가 죽으면 다른 워커가 기록을 재생해 정확히 같은 지점에서 이어갑니다.
+
+### 5. 타임아웃 계층
+
+- LLM 호출 하나: 60~120초
+- 도구 호출 하나: 도구별(검색 15초, 코드 실행 30초)
+- 에이전트 턴 수: 최대 N
+- 작업 전체: 데드라인(예: 30분). 넘으면 지금까지의 결과로 부분 완료 처리
+- 사람 승인 대기: 만료(예: 72시간) 후 자동 취소 + 알림
+
+## 심화
+
+### 보상(compensation)과 사가(saga)
+
+여러 외부 시스템에 걸친 작업(예: 예약 → 결제 → 알림)이 중간에 실패하면, 이미 한 일을 되돌리는 보상 작업(예약 취소, 결제 환불)을 역순으로 실행합니다. 에이전트가 부수효과 있는 도구를 여러 개 쓰는 경우, 각 도구에 대응하는 보상 동작을 정의해두면 실패 처리가 명확해집니다.
+
+### 부하와 레이트 리밋
+
+워커를 늘려도 **LLM 공급자의 RPM·TPM 한도**가 실질적 상한입니다. 전역 토큰 버킷(Redis)으로 워커 전체의 요청률을 제한하고, 우선순위 큐로 실시간 요청(채팅)을 배치 작업보다 먼저 처리합니다. 한도에 가까워지면 작은 모델로 강등하거나 배치 API로 돌립니다.
+
+### 장애 시나리오 연습 (game day)
+
+- LLM 공급자 하나가 10분간 529 → Fallback이 동작하는가
+- 워커 절반을 강제 종료 → 작업이 재개되는가, 중복 부수효과가 없는가
+- 도구 API가 30초씩 지연 → 타임아웃과 부분 완료가 동작하는가
+- 큐에 작업 1,000개 폭주 → 대기 시간과 비용 예산이 통제되는가
+
+### 백그라운드·비동기 에이전트의 UX
+
+사용자가 기다리지 않는 에이전트(코드 리뷰 봇, 야간 리서치, 이메일 분류)가 늘고 있습니다. 시작 알림, 진행 상황 페이지, 완료 알림(메일·슬랙), 결과 검토 화면, 실패 시 사람이 이어받는 경로를 설계해야 합니다. 여러 에이전트를 병렬로 돌리면 **사람의 검토가 병목**이 되므로, 검토를 결과물 단계가 아니라 계획 단계로 앞당기는 방식도 쓰입니다.
+
+## 실습 과제: 죽지 않는 리서치 서비스 (Phase 6 완료 과제)
+
+포트폴리오 프로젝트 1에 적용합니다.
+
+**요구사항**
+
+1. `POST /jobs`, `GET /jobs/{id}`, `GET /jobs/{id}/events`(SSE, Last-Event-ID), `POST /jobs/{id}/cancel`.
+2. 워커는 별도 프로세스(컨테이너)로, LangGraph 체크포인트(Postgres) 또는 Temporal로 내구성을 확보한다.
+3. 모든 부수효과 도구(파일 저장, 알림 발송)는 멱등 키를 쓴다.
+4. 타임아웃 계층(호출·도구·턴·전체 데드라인)을 모두 적용한다.
+5. Game day: 작업 실행 중 워커를 `kill -9`하고 재시작 → 작업이 이어서 완료되고 알림이 한 번만 간다.
+6. 부하 테스트: 작업 20개를 동시에 넣어 완료 시간 분포, 실패율, 총비용을 측정하고 전역 레이트 리밋이 동작함을 확인한다.
+
+**채점 기준**
+
+- [ ] 워커 강제 종료 후 재개 성공 + 중복 부수효과 없음
+- [ ] 클라이언트 재접속 시 놓친 이벤트부터 받는다
+- [ ] 취소 API가 진행 중인 LLM 호출을 멈춘다
+- [ ] 부하 테스트 결과표가 있다
+
+## 면접 질문
+
+<details>
+<summary>오래 걸리는 에이전트 작업의 신뢰성을 어떻게 보장하나요?</summary>
+
+요청-응답 대신 작업 큐와 워커 구조로 바꾸고, 상태를 체크포인트로 외부화해 워커가 죽어도 마지막 완료 단계부터 재개하게 합니다. 일시적 오류는 지터 백오프로 재시도하고, 부수효과가 있는 단계는 멱등 키로 중복 실행을 막으며, LLM 호출·도구·턴·전체 작업에 계층적 타임아웃을 둡니다. 진행 이벤트를 저장해 클라이언트가 재접속해도 이어받게 하고, 취소와 부분 완료 처리를 지원합니다. 필요하면 Temporal 같은 durable execution 엔진을 쓰고, 장애 시나리오 연습으로 검증합니다.
+</details>
+
+<details>
+<summary>Durable execution이란 무엇이고 에이전트에 왜 필요한가요?</summary>
+
+프로세스가 어디서 중단되든 완료된 단계의 결과를 기록해두고, 재시작 시 기록을 재생해 정확히 중단 지점부터 이어 실행하는 실행 모델입니다. 에이전트는 실행 시간이 길고, LLM 호출이 비결정적이라 다시 하면 결과가 달라지며, 외부 부수효과가 있고, 사람 승인처럼 긴 대기가 있기 때문에 필요합니다. 완료된 LLM 호출 결과를 재사용하므로 비용과 일관성을 모두 지킵니다.
+</details>
+
+<details>
+<summary>에이전트 도구에서 멱등성이 왜 중요한가요?</summary>
+
+재시도, 체크포인트 재개, 네트워크 중복 요청으로 같은 도구 호출이 여러 번 실행될 수 있기 때문입니다. 결제, 메일 발송, 티켓 생성 같은 부수효과가 두 번 일어나면 실제 피해가 생깁니다. 작업·단계 ID로 결정적인 멱등 키를 만들고, 실행 기록을 저장해 같은 키는 이전 결과를 돌려주며, 외부 API가 멱등 키를 지원하면 함께 전달합니다.
+</details>
+
+## 더 읽기
+
+- [Temporal: Durable execution 개념](https://docs.temporal.io/)
+- [LangGraph: Durable execution](https://docs.langchain.com/oss/python/langgraph/durable-execution)
+- [AWS Builders' Library: Timeouts, retries, and backoff with jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/)
+
+<Checklist week="w21" />
+<Notes week="w21" />

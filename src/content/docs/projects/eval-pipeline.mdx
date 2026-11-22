@@ -1,0 +1,60 @@
+---
+title: "5. 평가·관측 파이프라인"
+description: 다른 프로젝트에 붙는 평가 세트, 채점기, judge 검증, CI 회귀 차단, 트레이스-데이터셋 순환을 갖춘 LLMOps 파이프라인. 필수 프로젝트.
+sidebar:
+  order: 5
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+<Aside type="tip" title="왜 필수인가">
+에이전트를 만들어본 지원자는 많지만, **측정 체계를 갖춘 지원자는 드뭅니다.** 이 프로젝트가 "운영할 수 있는 사람"이라는 신호를 가장 강하게 줍니다.
+</Aside>
+
+## 한 줄 정의
+
+프로젝트 1~4 중 하나 이상에 붙어, 평가 세트 관리·다층 채점·judge 검증·반복 실행 통계·CI 회귀 차단·프로덕션 트레이스에서 평가 세트로의 순환을 자동화하는 파이프라인.
+
+## 구성
+
+```
+evals/
+  datasets/            # JSONL, 버전 관리, 태그(happy/edge/refuse/attack)
+  graders/
+    code.py            # 상태 확인, 스키마, 정규식
+    trajectory.py      # 필수/금지 도구, 효율, 반복 감지
+    judge.py           # 기준별 PASS/FAIL, 근거 먼저
+  calibration/
+    human_labels.jsonl # 사람 라벨
+    agreement.py       # 일치율, FAIL 재현율, Cohen's kappa
+  run.py               # 반복 실행, 병렬, 비용 집계
+  compare.py           # 기준 대비 diff, 신뢰구간, must-pass, 리포트 생성
+  harvest.py           # Langfuse에서 낮은 점수 트레이스 수집 → 검토 큐
+.github/workflows/eval.yml
+```
+
+## 요구사항
+
+1. 평가 세트 2종 이상(기능, 보안), 각 50개 이상, 태그와 성공 기준 포함 (14, 17주차)
+2. 채점기 3종(코드, 궤적, judge) (14주차)
+3. judge 보정: 사람 라벨 40개 이상과 비교, 루브릭 개선 이력 (14주차)
+4. 각 항목 k회 반복, pass@1·pass^k·신뢰구간 (14주차)
+5. CI: PR smoke, main full, must-pass·임계값 기반 실패, PR 코멘트 리포트 (16주차)
+6. 트레이스 연동: 평가 실행이 Langfuse 실험으로 기록, 점수가 트레이스에 Score로 (15주차)
+7. harvest: 낮은 점수·부정 피드백 트레이스 → 사람 검토 → 평가 세트 추가 (16주차)
+8. 실험 기록: 프롬프트 변경 3회, 모델 교체 2회의 비교 리포트
+
+## 보여줄 결과물
+
+- 리포트 예시(HTML/마크다운): 점수·비용·지연 diff, 새로 실패한 항목, 신뢰구간
+- CI가 나쁜 변경을 막은 PR 스크린샷
+- judge-사람 일치율 개선 이력(kappa 0.4 → 0.8 같은)
+- 모델 교체 비교표
+
+## 면접에서 나올 질문
+
+- LLM-as-judge를 어떻게 믿을 수 있게 했나?
+- 평가 세트는 어떻게 만들고 업데이트했나? 과적합은?
+- CI 평가의 비용과 시간은 어떻게 관리했나?
+- 점수가 3%p 올랐는데 이게 진짜 개선인가?
+- 오프라인 평가 점수와 실제 사용자 만족이 다르면?
