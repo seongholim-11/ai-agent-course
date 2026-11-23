@@ -19,6 +19,17 @@ const label = (id: string, title: string) => `${Number(id.slice(1))}주차 · ${
   </div>
   <div class="aac-bar aac-bar-lg"><span id="aac-total-bar" style="width:0%"></span></div>
 
+  <section class="aac-phase aac-study">
+    <h3>공부량 <small>주차별 학습 단계 버튼 기준</small></h3>
+    <div class="aac-study-grid">
+      <div class="aac-study-stat" data-step="read"><span class="aac-study-num">0</span><span class="aac-hint">📖 읽기 완료 / {weeks.length}주</span></div>
+      <div class="aac-study-stat" data-step="practice"><span class="aac-study-num">0</span><span class="aac-hint">🛠️ 실습 완료 / {weeks.length}주</span></div>
+      <div class="aac-study-stat" data-step="understand"><span class="aac-study-num">0</span><span class="aac-hint">💡 이해 완료 / {weeks.length}주</span></div>
+      <div class="aac-study-stat" data-step="recent"><span class="aac-study-num">0</span><span class="aac-hint">최근 7일 완료한 단계</span></div>
+    </div>
+    <p class="aac-hint" id="aac-study-last"></p>
+  </section>
+
   {phases.map((p) => (
     <section class="aac-phase">
       <h3>Phase {p.id} · {p.title} <small>{p.weeks}</small></h3>
@@ -27,7 +38,12 @@ const label = (id: string, title: string) => `${Number(id.slice(1))}주차 · ${
         {weeks.filter((w) => w.phase === p.id).map((w) => (
           <li data-week={w.id} data-n={w.checklist.length} data-href={href(w.slug)} data-title={label(w.id, w.title)}>
             <a href={href(w.slug)}>{label(w.id, w.title)}</a>
-            <span class="aac-wk-count">0 / {w.checklist.length}</span>
+            <span class="aac-wk-right">
+              <span class="aac-wk-steps" aria-label="학습 단계">
+                <span data-step="read" title="읽기 완료">📖</span><span data-step="practice" title="실습 완료">🛠️</span><span data-step="understand" title="이해 완료">💡</span>
+              </span>
+              <span class="aac-wk-count">0 / {w.checklist.length}</span>
+            </span>
             <div class="aac-bar"><span style="width:0%"></span></div>
           </li>
         ))}
@@ -134,6 +150,35 @@ const label = (id: string, title: string) => `${Number(id.slice(1))}주차 · ${
     });
   }
 
+  function renderStudy() {
+    const steps = ['read', 'practice', 'understand'] as const;
+    const counts = { read: 0, practice: 0, understand: 0 };
+    const weekAgo = Date.now() - 7 * 24 * 3600 * 1000;
+    let recent = 0;
+    let last: { at: string; title: string; step: string } | null = null;
+    const names = { read: '읽기', practice: '실습', understand: '이해' };
+    root.querySelectorAll<HTMLElement>('li[data-week]').forEach((li) => {
+      let s: Record<string, string> = {};
+      try { s = JSON.parse(read(`aac:status:${li.dataset.week}`) || '{}'); } catch {}
+      steps.forEach((k) => {
+        const at = s[k];
+        li.querySelector(`.aac-wk-steps [data-step="${k}"]`)?.classList.toggle('is-done', !!at);
+        if (!at) return;
+        counts[k]++;
+        if (Date.parse(at) >= weekAgo) recent++;
+        if (!last || at > last.at) last = { at, title: li.dataset.title!, step: names[k] };
+      });
+    });
+    steps.forEach((k) => {
+      root.querySelector(`.aac-study-stat[data-step="${k}"] .aac-study-num`)!.textContent = String(counts[k]);
+    });
+    root.querySelector('.aac-study-stat[data-step="recent"] .aac-study-num')!.textContent = String(recent);
+    const lastEl = document.getElementById('aac-study-last')!;
+    const l = last as { at: string; title: string; step: string } | null;
+    lastEl.textContent = l ? `마지막 기록: ${new Date(l.at).toLocaleDateString('ko-KR')} · ${l.title} ${l.step} 완료` : '아직 기록이 없습니다. 각 주차 페이지 하단의 버튼을 눌러 기록하세요.';
+  }
+
   render();
   renderQuiz();
+  renderStudy();
 </script>

@@ -263,3 +263,47 @@ mark.aac-hl {
 .aac-quiz-reset:hover { border-color: var(--sl-color-accent); }
 .aac-q-self button.is-chosen { border-color: var(--sl-color-accent); background: var(--sl-color-accent-low); color: var(--sl-color-accent-high); }
 .aac-q-reveal[hidden] { display: none; }
+
+/* ── 학습 단계 버튼 ── */
+.aac-status {
+  border: 1px solid var(--aac-border);
+  border-radius: 0.75rem;
+  padding: 1rem 1.25rem;
+  margin: 1.5rem 0;
+  background: var(--sl-color-bg-nav);
+}
+.aac-status-btns { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.5rem; margin-top: 0.6rem; }
+@media (max-width: 30rem) { .aac-status-btns { grid-template-columns: 1fr; } }
+.aac-status-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.15rem;
+  padding: 0.7rem 0.5rem;
+  font: inherit;
+  font-size: var(--sl-text-sm);
+  border: 1px solid var(--aac-border);
+  border-radius: 0.6rem;
+  background: var(--sl-color-bg);
+  color: var(--sl-color-text);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.aac-status-btn:hover { border-color: var(--aac-accent); }
+.aac-status-btn[aria-pressed='true'] {
+  border-color: var(--sl-color-green);
+  background: var(--sl-color-green-low);
+  color: var(--sl-color-white);
+  font-weight: 600;
+}
+.aac-status-icon { font-size: 1.3rem; filter: grayscale(1); opacity: 0.6; }
+.aac-status-btn[aria-pressed='true'] .aac-status-icon { filter: none; opacity: 1; }
+.aac-status-date { font-size: var(--sl-text-xs); color: var(--sl-color-gray-3); min-height: 1em; font-weight: 400; }
+.aac-study-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(8rem, 1fr)); gap: 0.75rem; margin-top: 0.75rem; }
+.aac-study-stat { display: flex; flex-direction: column; padding: 0.6rem 0.8rem; border-radius: 0.5rem; background: var(--sl-color-bg); }
+.aac-study-stat .aac-hint { margin-top: 0.1rem; }
+.aac-study-num { font-size: 1.75rem; font-weight: 700; color: var(--sl-color-white); line-height: 1.1; font-variant-numeric: tabular-nums; }
+.aac-wk-right { display: inline-flex; align-items: center; gap: 0.6rem; }
+.aac-wk-steps { display: inline-flex; gap: 0.15rem; font-size: 0.85rem; }
+.aac-wk-steps span { filter: grayscale(1); opacity: 0.25; }
+.aac-wk-steps span.is-done { filter: none; opacity: 1; }

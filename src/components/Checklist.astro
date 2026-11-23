@@ -1,10 +1,12 @@
 ---
 import { weekById } from '../data/course';
+import StudyStatus from './StudyStatus.astro';
 interface Props { week: string }
 const { week } = Astro.props;
 const data = weekById(week);
 if (!data) throw new Error(`Unknown week ${week}`);
 ---
+<StudyStatus week={week} />
 <section class="aac-checklist not-content" data-week={week}>
   <div class="aac-checklist-head">
     <strong>이번 주 완료 체크</strong>

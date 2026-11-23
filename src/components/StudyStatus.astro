@@ -1,0 +1,66 @@
+---
+// 주차별 학습 단계 버튼: 읽기 완료 → 실습 완료 → 이해 완료.
+// 저장: localStorage `aac:status:wNN` = { read?: ISO시각, practice?: ISO시각, understand?: ISO시각 }
+interface Props { week: string }
+const { week } = Astro.props;
+const steps = [
+  { key: 'read', icon: '📖', label: '읽기 완료', hint: '본문과 심화를 끝까지 읽었다' },
+  { key: 'practice', icon: '🛠️', label: '실습 완료', hint: '실습 과제를 채점 기준까지 마쳤다' },
+  { key: 'understand', icon: '💡', label: '이해 완료', hint: '면접 질문에 답을 보지 않고 설명할 수 있다' },
+];
+---
+<section class="aac-status not-content" data-week={week}>
+  <div class="aac-checklist-head">
+    <strong>이번 주 학습 단계</strong>
+    <span class="aac-status-count aac-hint" aria-live="polite">0 / 3</span>
+  </div>
+  <div class="aac-status-btns">
+    {steps.map((s) => (
+      <button type="button" class="aac-status-btn" data-key={s.key} aria-pressed="false" title={s.hint}>
+        <span class="aac-status-icon" aria-hidden="true">{s.icon}</span>
+        <span class="aac-status-label">{s.label}</span>
+        <span class="aac-status-date"></span>
+      </button>
+    ))}
+  </div>
+  <p class="aac-hint">버튼을 다시 누르면 취소됩니다. 완료 날짜는 대시보드의 공부량 통계에 쓰입니다.</p>
+</section>
+
+<script>
+  type Status = Partial<Record<'read' | 'practice' | 'understand', string>>;
+  const fmt = (iso: string) => {
+    const d = new Date(iso);
+    return `${d.getMonth() + 1}/${d.getDate()}`;
+  };
+  document.querySelectorAll<HTMLElement>('.aac-status').forEach((root) => {
+    const KEY = `aac:status:${root.dataset.week}`;
+    const load = (): Status => {
+      try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch { return {}; }
+    };
+    const save = (s: Status) => {
+      try {
+        if (Object.keys(s).length) localStorage.setItem(KEY, JSON.stringify(s));
+        else localStorage.removeItem(KEY);
+      } catch {}
+    };
+    const btns = [...root.querySelectorAll<HTMLButtonElement>('.aac-status-btn')];
+    const render = () => {
+      const s = load();
+      btns.forEach((b) => {
+        const at = s[b.dataset.key as keyof Status];
+        b.setAttribute('aria-pressed', String(!!at));
+        b.querySelector('.aac-status-date')!.textContent = at ? fmt(at) : '';
+      });
+      root.querySelector('.aac-status-count')!.textContent = `${Object.keys(s).length} / 3`;
+    };
+    btns.forEach((b) => b.addEventListener('click', () => {
+      const s = load();
+      const k = b.dataset.key as keyof Status;
+      if (s[k]) delete s[k];
+      else s[k] = new Date().toISOString();
+      save(s);
+      render();
+    }));
+    render();
+  });
+</script>
