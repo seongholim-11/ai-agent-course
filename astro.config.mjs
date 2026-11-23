@@ -24,6 +24,10 @@ export default defineConfig({
       locales: { root: { label: '한국어', lang: 'ko' } },
       social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/seongholim-11/ai-agent-course' }],
       customCss: ['./src/styles/custom.css'],
+      components: {
+        SocialIcons: './src/components/SocialIcons.astro',
+        MarkdownContent: './src/components/MarkdownContent.astro',
+      },
       lastUpdated: false,
       sidebar: [
         {

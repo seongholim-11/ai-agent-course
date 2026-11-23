@@ -1,0 +1,243 @@
+---
+import Default from '@astrojs/starlight/components/MarkdownContent.astro';
+---
+
+<Default><slot /></Default>
+
+<script>
+  // 본문을 드래그하면 형광펜 메뉴가 뜨고, 고른 색으로 하이라이트를 저장한다.
+  // 저장 위치: localStorage `aac:hl:<페이지 경로>` = [{ id, s, e, t, c }]
+  //   s/e = 본문 텍스트 기준 시작·끝 오프셋, t = 하이라이트한 텍스트(검증·복구용), c = 색
+  type HL = { id: string; s: number; e: number; t: string; c: string };
+
+  const root = document.querySelector<HTMLElement>('.sl-markdown-content');
+  if (root) init(root);
+
+  function init(root: HTMLElement) {
+    const COLORS: [string, string][] = [
+      ['yellow', '노랑'],
+      ['green', '초록'],
+      ['blue', '파랑'],
+      ['pink', '분홍'],
+    ];
+    const EXCLUDE = '.not-content, .aac-checklist, .aac-notes, textarea, input, button, script, style, svg, .copy';
+    const path = location.pathname.endsWith('/') ? location.pathname : location.pathname + '/';
+    const KEY = `aac:hl:${path}`;
+
+    const load = (): HL[] => {
+      try {
+        const v = JSON.parse(localStorage.getItem(KEY) || '[]');
+        return Array.isArray(v) ? v : [];
+      } catch {
+        return [];
+      }
+    };
+    const save = (list: HL[]) => {
+      try {
+        if (list.length) localStorage.setItem(KEY, JSON.stringify(list));
+        else localStorage.removeItem(KEY);
+      } catch {}
+    };
+
+    const excluded = (n: Node) => {
+      const el = n.nodeType === Node.ELEMENT_NODE ? (n as Element) : n.parentElement;
+      return !el || !!el.closest(EXCLUDE);
+    };
+
+    function textNodes(): Text[] {
+      const out: Text[] = [];
+      const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+        acceptNode: (n) => (excluded(n) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT),
+      });
+      while (w.nextNode()) out.push(w.currentNode as Text);
+      return out;
+    }
+
+    // DOM 위치(node, offset)를 본문 텍스트 오프셋으로 변환
+    function toOffset(nodes: Text[], node: Node, offset: number): number {
+      const point = document.createRange();
+      point.setStart(node, offset);
+      let acc = 0;
+      for (const t of nodes) {
+        if (t === node) return acc + offset;
+        if (point.comparePoint(t, 0) >= 0) return acc;
+        acc += t.length;
+      }
+      return acc;
+    }
+
+    function wrap(nodes: Text[], h: HL) {
+      const segs: [Text, number, number][] = [];
+      let acc = 0;
+      for (const t of nodes) {
+        const a = acc, b = acc + t.length;
+        acc = b;
+        if (b <= h.s || a >= h.e) continue;
+        const s = Math.max(h.s, a) - a, e = Math.min(h.e, b) - a;
+        if (!t.data.slice(s, e).trim()) continue; // 표 셀 사이 공백 등은 감싸지 않는다
+        segs.push([t, s, e]);
+      }
+      for (const [t, s, e] of segs) {
+        const mid = s > 0 ? t.splitText(s) : t;
+        if (e - s < mid.length) mid.splitText(e - s);
+        const mark = document.createElement('mark');
+        mark.className = `aac-hl aac-hl-${h.c}`;
+        mark.dataset.hl = h.id;
+        mid.replaceWith(mark);
+        mark.appendChild(mid);
+      }
+    }
+
+    function unwrap(id: string) {
+      root.querySelectorAll<HTMLElement>(`mark.aac-hl[data-hl="${id}"]`).forEach((m) => {
+        const parent = m.parentNode!;
+        while (m.firstChild) parent.insertBefore(m.firstChild, m);
+        m.remove();
+        parent.normalize();
+      });
+    }
+
+    // 저장된 하이라이트 복원. 본문이 바뀌어 오프셋이 어긋나면 텍스트로 다시 찾는다.
+    function restore() {
+      const list = load();
+      if (!list.length) return;
+      const nodes = textNodes();
+      const full = nodes.map((t) => t.data).join('');
+      let changed = false;
+      for (const h of list) {
+        if (full.slice(h.s, h.e) !== h.t) {
+          const i = full.indexOf(h.t);
+          if (i < 0) continue;
+          h.s = i;
+          h.e = i + h.t.length;
+          changed = true;
+        }
+      }
+      for (const h of [...list].sort((a, b) => a.s - b.s)) {
+        if (full.slice(h.s, h.e) === h.t) wrap(textNodes(), h);
+      }
+      if (changed) save(list);
+    }
+
+    // ── 팝업 메뉴 ──
+    const pop = document.createElement('div');
+    pop.className = 'aac-hl-pop';
+    pop.setAttribute('role', 'toolbar');
+    pop.hidden = true;
+    document.body.appendChild(pop);
+    // 버튼을 눌러도 선택 영역이 풀리지 않게 한다
+    pop.addEventListener('pointerdown', (e) => e.preventDefault());
+
+    function place(rect: DOMRect) {
+      pop.hidden = false;
+      const w = pop.offsetWidth, h = pop.offsetHeight;
+      const coarse = matchMedia('(pointer: coarse)').matches; // 모바일은 기본 메뉴를 피해 아래쪽
+      let top = coarse || rect.top < h + 12 ? rect.bottom + 8 : rect.top - h - 8;
+      let left = rect.left + rect.width / 2 - w / 2;
+      left = Math.max(8, Math.min(left, document.documentElement.clientWidth - w - 8));
+      pop.style.top = `${top + scrollY}px`;
+      pop.style.left = `${left + scrollX}px`;
+    }
+    const hide = () => {
+      pop.hidden = true;
+      pop.replaceChildren();
+    };
+
+    function showCreate(range: Range) {
+      pop.replaceChildren();
+      for (const [c, label] of COLORS) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = `aac-hl-swatch aac-hl-${c}`;
+        b.title = `${label} 형광펜`;
+        b.setAttribute('aria-label', `${label} 형광펜`);
+        b.addEventListener('click', () => create(range, c));
+        pop.appendChild(b);
+      }
+      place(range.getBoundingClientRect());
+    }
+
+    function showDelete(mark: HTMLElement) {
+      const id = mark.dataset.hl!;
+      pop.replaceChildren();
+      for (const [c, label] of COLORS) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = `aac-hl-swatch aac-hl-${c}`;
+        b.title = `${label}으로 바꾸기`;
+        b.setAttribute('aria-label', `${label}으로 바꾸기`);
+        b.addEventListener('click', () => recolor(id, c));
+        pop.appendChild(b);
+      }
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'aac-hl-del';
+      del.textContent = '삭제';
+      del.addEventListener('click', () => {
+        unwrap(id);
+        save(load().filter((h) => h.id !== id));
+        hide();
+      });
+      pop.appendChild(del);
+      place(mark.getBoundingClientRect());
+    }
+
+    function create(range: Range, c: string) {
+      const nodes = textNodes();
+      const s = toOffset(nodes, range.startContainer, range.startOffset);
+      const e = toOffset(nodes, range.endContainer, range.endOffset);
+      const full = nodes.map((t) => t.data).join('');
+      const t = full.slice(s, e);
+      if (e > s && t.trim()) {
+        const h: HL = { id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), s, e, t, c };
+        wrap(nodes, h);
+        save([...load(), h]);
+      }
+      getSelection()?.removeAllRanges();
+      hide();
+    }
+
+    function recolor(id: string, c: string) {
+      root.querySelectorAll<HTMLElement>(`mark.aac-hl[data-hl="${id}"]`).forEach((m) => {
+        m.className = `aac-hl aac-hl-${c}`;
+      });
+      save(load().map((h) => (h.id === id ? { ...h, c } : h)));
+      hide();
+    }
+
+    let timer: ReturnType<typeof setTimeout>;
+    document.addEventListener('selectionchange', () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const sel = getSelection();
+        if (!sel || sel.isCollapsed || !sel.rangeCount) {
+          if (pop.dataset.mode === 'create') hide();
+          return;
+        }
+        const range = sel.getRangeAt(0);
+        if (!root.contains(range.commonAncestorContainer) || !sel.toString().trim()) return;
+        if (excluded(range.startContainer) && excluded(range.endContainer)) return;
+        pop.dataset.mode = 'create';
+        showCreate(range.cloneRange());
+      }, 180);
+    });
+
+    root.addEventListener('click', (e) => {
+      const mark = (e.target as Element).closest?.('mark.aac-hl') as HTMLElement | null;
+      if (!mark || !getSelection()?.isCollapsed) return;
+      pop.dataset.mode = 'edit';
+      showDelete(mark);
+    });
+
+    document.addEventListener('pointerdown', (e) => {
+      if (pop.hidden || pop.contains(e.target as Node)) return;
+      if ((e.target as Element).closest?.('mark.aac-hl')) return;
+      if (pop.dataset.mode === 'edit') hide();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') hide();
+    });
+
+    restore();
+  }
+</script>

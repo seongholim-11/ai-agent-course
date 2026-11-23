@@ -47,9 +47,9 @@ const label = (id: string, title: string) => `${Number(id.slice(1))}주차 · ${
 </div>
 
 <script>
+  import { exportProgress, importProgress } from '../scripts/backup';
   const KEY = 'aac:progress';
   const read = (k: string) => { try { return localStorage.getItem(k); } catch { return null; } };
-  const write = (k: string, v: string) => { try { localStorage.setItem(k, v); return true; } catch { return false; } };
   const root = document.querySelector<HTMLElement>('.aac-dash')!;
   const msg = document.getElementById('aac-msg')!;
 
@@ -82,34 +82,16 @@ const label = (id: string, title: string) => `${Number(id.slice(1))}주차 · ${
   }
 
   document.getElementById('aac-export')!.addEventListener('click', () => {
-    const dump: Record<string, string> = {};
-    try {
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i)!;
-        if (k.startsWith('aac:')) dump[k] = localStorage.getItem(k) || '';
-      }
-    } catch {
-      msg.textContent = '이 브라우저에서는 저장소에 접근할 수 없습니다.';
-      return;
-    }
-    const blob = new Blob([JSON.stringify(dump, null, 2)], { type: 'application/json' });
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `ai-agent-course-progress-${new Date().toISOString().slice(0, 10)}.json`;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    msg.textContent = '내보냈습니다.';
+    msg.textContent = exportProgress() ? '내보냈습니다.' : '이 브라우저에서는 저장소에 접근할 수 없습니다.';
   });
 
   document.getElementById('aac-import')!.addEventListener('change', async (e) => {
-    const file = (e.target as HTMLInputElement).files?.[0];
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
     if (!file) return;
     try {
-      const data = JSON.parse(await file.text());
-      let n = 0;
-      for (const [k, v] of Object.entries(data)) {
-        if (k.startsWith('aac:') && typeof v === 'string' && write(k, v)) n++;
-      }
+      const n = await importProgress(file);
       msg.textContent = `${n}개 항목을 불러왔습니다.`;
       render();
     } catch {
