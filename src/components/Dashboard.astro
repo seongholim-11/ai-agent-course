@@ -1,5 +1,6 @@
 ---
 import { phases, weeks } from '../data/course';
+import { quizzes } from '../data/quizzes';
 const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 const href = (slug: string) => `${base}/${slug}/`;
 const total = weeks.reduce((n, w) => n + w.checklist.length, 0);
@@ -31,6 +32,10 @@ const label = (id: string, title: string) => `${Number(id.slice(1))}주차 · ${
           </li>
         ))}
       </ul>
+      <p class="aac-quiz-line" data-quiz={p.id} data-mc={quizzes[p.id].filter((q) => q.type === 'mc').length}>
+        <a href={href(`phase-${p.id}/quiz`)}>Phase {p.id} 총정리 퀴즈</a>
+        <span class="aac-wk-count">아직 안 풂</span>
+      </p>
     </section>
   ))}
 
@@ -115,5 +120,20 @@ const label = (id: string, title: string) => `${Number(id.slice(1))}주차 · ${
     render();
   });
 
+  function renderQuiz() {
+    root.querySelectorAll<HTMLElement>('.aac-quiz-line').forEach((el) => {
+      let v: any = {};
+      try { v = JSON.parse(read(`aac:quiz:p${el.dataset.quiz}`) || '{}'); } catch {}
+      const total = Number(el.dataset.mc);
+      const answered = Object.keys(v.mc || {}).length;
+      const out = el.querySelector('.aac-wk-count')!;
+      if (v.best !== undefined) out.textContent = `최고 ${v.best} / ${total}`;
+      else if (answered) out.textContent = `푸는 중 ${answered} / ${total}`;
+      else out.textContent = '아직 안 풂';
+      el.classList.toggle('aac-complete', v.best !== undefined && v.best / total >= 0.8);
+    });
+  }
+
   render();
+  renderQuiz();
 </script>

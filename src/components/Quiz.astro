@@ -1,0 +1,193 @@
+---
+import { quizzes, type Question } from '../data/quizzes';
+import { weeks } from '../data/course';
+
+interface Props { phase: number }
+const { phase } = Astro.props;
+// 정답 위치가 한쪽에 몰리지 않도록 빌드 시 결정적으로 보기를 섞는다(같은 문항은 항상 같은 순서).
+const rng = (seed: number) => () => {
+  seed = (seed * 1664525 + 1013904223) % 4294967296;
+  return seed / 4294967296;
+};
+const questions: Question[] = (quizzes[phase] ?? []).map((q, i) => {
+  if (q.type !== 'mc') return q;
+  const rand = rng(phase * 1000 + i * 37 + 11);
+  const correct = q.choices[q.answer];
+  const others = q.choices.filter((_, ci) => ci !== q.answer);
+  for (let k = others.length - 1; k > 0; k--) {
+    const j = Math.floor(rand() * (k + 1));
+    [others[k], others[j]] = [others[j], others[k]];
+  }
+  const target = (i * 3 + phase) % q.choices.length;
+  const choices = [...others.slice(0, target), correct, ...others.slice(target)];
+  return { ...q, choices, answer: target };
+});
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const mcCount = questions.filter((q) => q.type === 'mc').length;
+const shortCount = questions.length - mcCount;
+
+const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const fmt = (s: string) =>
+  esc(s)
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+const weekLink = (n: number) => {
+  const w = weeks.find((x) => Number(x.id.slice(1)) === n)!;
+  return { href: `${base}/${w.slug}/`, label: `${n}주차 · ${w.title}` };
+};
+const letters = ['A', 'B', 'C', 'D', 'E'];
+---
+
+<div class="aac-quiz not-content" data-phase={phase} data-mc={mcCount} data-short={shortCount}>
+  <div class="aac-quiz-score">
+    <div>
+      <strong>객관식 <span data-score>0</span> / {mcCount}</strong>
+      <span class="aac-hint">푼 문항 <span data-answered>0</span> / {mcCount} · 서술형 자가 채점 <span data-selfscore>0</span> / {shortCount} · 최고 기록 <span data-best>-</span></span>
+    </div>
+    <button type="button" class="aac-quiz-reset">다시 풀기</button>
+  </div>
+
+  <ol class="aac-quiz-list">
+    {questions.map((q, i) => {
+      const wl = weekLink(q.week);
+      return q.type === 'mc' ? (
+        <li class="aac-q" data-i={i} data-type="mc" data-answer={q.answer}>
+          <p class="aac-q-text"><span class="aac-q-tag">객관식</span><span set:html={fmt(q.q)} /></p>
+          <div class="aac-q-choices" role="group">
+            {q.choices.map((c, ci) => (
+              <button type="button" class="aac-choice" data-ci={ci}>
+                <span class="aac-choice-letter">{letters[ci]}</span>
+                <span set:html={fmt(c)} />
+              </button>
+            ))}
+          </div>
+          <div class="aac-q-explain" hidden>
+            <p><strong class="aac-q-verdict"></strong> 정답: {letters[q.answer]}</p>
+            <p set:html={fmt(q.explain)} />
+            <p class="aac-hint">복습: <a href={wl.href}>{wl.label}</a></p>
+          </div>
+        </li>
+      ) : (
+        <li class="aac-q" data-i={i} data-type="short">
+          <p class="aac-q-text"><span class="aac-q-tag aac-q-tag-short">서술형</span><span set:html={fmt(q.q)} /></p>
+          <p class="aac-hint">먼저 소리 내어 답하거나 메모에 적어본 뒤 모범 답안을 펼치세요.</p>
+          <button type="button" class="aac-q-reveal">모범 답안 보기</button>
+          <div class="aac-q-explain" hidden>
+            <p><strong>모범 답안에 들어가야 할 핵심</strong></p>
+            <ul>{q.points.map((p) => <li set:html={fmt(p)} />)}</ul>
+            <div class="aac-q-self">
+              <span>내 답은?</span>
+              <button type="button" data-self="1">핵심을 대부분 짚었다</button>
+              <button type="button" data-self="0">빠진 게 많다</button>
+            </div>
+            <p class="aac-hint">복습: <a href={wl.href}>{wl.label}</a></p>
+          </div>
+        </li>
+      );
+    })}
+  </ol>
+</div>
+
+<script>
+  type State = { mc: Record<string, number>; self: Record<string, number>; open: Record<string, 1>; best?: number };
+
+  document.querySelectorAll<HTMLElement>('.aac-quiz').forEach((root) => {
+    const KEY = `aac:quiz:p${root.dataset.phase}`;
+    const mcTotal = Number(root.dataset.mc);
+    const load = (): State => {
+      try {
+        const v = JSON.parse(localStorage.getItem(KEY) || '{}');
+        return { mc: v.mc || {}, self: v.self || {}, open: v.open || {}, best: v.best };
+      } catch {
+        return { mc: {}, self: {}, open: {} };
+      }
+    };
+    const save = (s: State) => {
+      try { localStorage.setItem(KEY, JSON.stringify(s)); } catch {}
+    };
+    let state = load();
+
+    function paint() {
+      let score = 0;
+      root.querySelectorAll<HTMLElement>('.aac-q[data-type="mc"]').forEach((li) => {
+        const i = li.dataset.i!;
+        const answer = Number(li.dataset.answer);
+        const chosen = state.mc[i];
+        const done = chosen !== undefined;
+        if (done && chosen === answer) score++;
+        li.classList.toggle('aac-q-done', done);
+        li.classList.toggle('aac-q-right', done && chosen === answer);
+        li.classList.toggle('aac-q-wrong', done && chosen !== answer);
+        li.querySelectorAll<HTMLButtonElement>('.aac-choice').forEach((b) => {
+          const ci = Number(b.dataset.ci);
+          b.disabled = done;
+          b.classList.toggle('is-answer', done && ci === answer);
+          b.classList.toggle('is-chosen', done && ci === chosen);
+        });
+        li.querySelector<HTMLElement>('.aac-q-explain')!.hidden = !done;
+        li.querySelector('.aac-q-verdict')!.textContent = done ? (chosen === answer ? '정답!' : '오답.') : '';
+      });
+      root.querySelectorAll<HTMLElement>('.aac-q[data-type="short"]').forEach((li) => {
+        const i = li.dataset.i!;
+        const open = !!state.open[i];
+        li.querySelector<HTMLElement>('.aac-q-explain')!.hidden = !open;
+        li.querySelector<HTMLElement>('.aac-q-reveal')!.hidden = open;
+        li.querySelectorAll<HTMLButtonElement>('[data-self]').forEach((b) => {
+          b.classList.toggle('is-chosen', state.self[i] === Number(b.dataset.self));
+        });
+      });
+      const answered = Object.keys(state.mc).length;
+      if (answered === mcTotal && (state.best === undefined || score > state.best)) {
+        state.best = score;
+        save(state);
+      }
+      root.querySelector('[data-score]')!.textContent = String(score);
+      root.querySelector('[data-answered]')!.textContent = String(answered);
+      root.querySelector("[data-selfscore]")!.textContent = String(Object.values(state.self).filter((v) => v === 1).length);
+      root.querySelector('[data-best]')!.textContent = state.best === undefined ? '-' : `${state.best} / ${mcTotal}`;
+    }
+
+    root.addEventListener('click', (e) => {
+      const t = e.target as Element;
+      const li = t.closest<HTMLElement>('.aac-q');
+      const choice = t.closest<HTMLButtonElement>('.aac-choice');
+      if (li && choice && state.mc[li.dataset.i!] === undefined) {
+        state.mc[li.dataset.i!] = Number(choice.dataset.ci);
+        save(state);
+        paint();
+        return;
+      }
+      if (li && t.closest('.aac-q-reveal')) {
+        state.open[li.dataset.i!] = 1;
+        save(state);
+        paint();
+        return;
+      }
+      const self = t.closest<HTMLButtonElement>('[data-self]');
+      if (li && self && self.tagName === 'BUTTON') {
+        state.self[li.dataset.i!] = Number(self.dataset.self);
+        save(state);
+        paint();
+      }
+    });
+
+    const reset = root.querySelector<HTMLButtonElement>('.aac-quiz-reset')!;
+    let armed = false;
+    reset.addEventListener('click', () => {
+      if (!armed) {
+        armed = true;
+        reset.textContent = '한 번 더 누르면 초기화';
+        setTimeout(() => { armed = false; reset.textContent = '다시 풀기'; }, 3000);
+        return;
+      }
+      armed = false;
+      reset.textContent = '다시 풀기';
+      state = { mc: {}, self: {}, open: {}, best: state.best };
+      save(state);
+      paint();
+      root.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+
+    paint();
+  });
+</script>
