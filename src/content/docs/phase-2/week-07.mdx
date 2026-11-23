@@ -24,18 +24,26 @@ Part03 멀티 에이전트 구조 정복하기&실습: LangGraph 기초와 구�
 
 ## 왜 그래프인가
 
-4주차의 while 루프는 단순하지만 다음이 어렵습니다.
+4주차의 while 루프는 단순해서 좋지만, 서비스로 만들려고 하면 곧 벽에 부딪힙니다.
 
-- 특정 단계에서 **멈추고 사람의 승인을 기다렸다가 이어서** 실행하기
+- 특정 단계에서 **멈추고 사람의 승인을 기다렸다가 이어서** 실행하기 (승인은 몇 분, 며칠 뒤에 올 수도 있습니다)
 - 서버가 재시작돼도 **같은 지점에서 재개**하기
-- "검색 → 판단 → (조건부) 승인 → 실행"처럼 **일부는 고정, 일부는 동적**인 흐름
+- "검색 → 판단 → (조건부) 승인 → 실행"처럼 **일부는 고정되고 일부는 모델이 정하는** 흐름
 - 어느 단계에서 무엇이 바뀌었는지 **단계별로 관측**하기
 
-LangGraph는 흐름을 노드(함수)와 엣지(전이)로 명시하고, 각 단계 후 상태를 체크포인트로 저장합니다. "에이전트 = LLM이 다음 엣지를 고르는 그래프"로 보면 워크플로우와 에이전트를 같은 틀에서 섞을 수 있습니다.
+while 루프는 이 모든 것이 파이썬 프로세스의 메모리 안에만 있어서, 프로세스가 멈추면 다 사라집니다.
+
+**LangGraph**는 흐름을 **노드(할 일 = 함수)**와 **엣지(다음에 어디로 갈지)**로 명시하는 라이브러리입니다. 지하철 노선도를 떠올리면 됩니다. 역(노드)에서 할 일을 하고, 선로(엣지)를 따라 다음 역으로 갑니다. 갈림길(조건부 엣지)에서는 상황에 따라 다른 노선을 탑니다. 그리고 역을 지날 때마다 "지금 어디까지 왔고 짐(상태)은 무엇인지"를 **체크포인트**로 저장합니다.
+
+이렇게 보면 "에이전트 = LLM이 다음 엣지를 고르는 그래프"입니다. 갈림길 선택을 코드가 하면 워크플로우, LLM이 하면 에이전트이니, 5주차의 두 방식을 같은 틀 안에서 섞을 수 있습니다.
 
 ## 핵심 개념
 
 ### 1. State와 Reducer
+
+**State(상태)**는 그래프 전체가 함께 들고 다니는 데이터 묶음입니다. 노드들은 이 상태를 읽고, 바꾸고 싶은 부분만 돌려줍니다.
+
+그런데 "바꾸고 싶은 부분"을 기존 값과 어떻게 합칠까요? 메시지 목록이라면 덮어쓰면 이전 대화가 사라지니 **뒤에 붙여야** 하고, 승인 여부 같은 값은 **덮어써야** 합니다. 이 합치는 규칙이 **Reducer**입니다.
 
 ```python
 from typing import Annotated, TypedDict
@@ -43,118 +51,143 @@ from langgraph.graph.message import add_messages
 import operator
 
 class State(TypedDict):
-    messages: Annotated[list, add_messages]     # 메시지는 덧붙이기(+ ID 같으면 교체)
-    findings: Annotated[list[str], operator.add]  # 병렬 노드 결과 합치기
-    approved: bool | None                        # reducer 없음 → 덮어쓰기
+    # Annotated[타입, 합치는 규칙]
+    # add_messages: 새 메시지를 목록 뒤에 덧붙인다 (같은 ID의 메시지가 오면 그 메시지를 교체)
+    messages: Annotated[list, add_messages]
+    # operator.add: 리스트끼리 더한다 → 병렬로 돈 노드들의 결과를 하나로 모을 때
+    findings: Annotated[list[str], operator.add]
+    # 규칙을 안 붙이면 → 새 값으로 덮어쓴다
+    approved: bool | None
 ```
 
-노드는 **변경분만** 반환하고, Reducer가 기존 상태와 합칩니다. 병렬로 실행된 노드들이 같은 키를 쓸 때 Reducer가 없으면 충돌 에러가 납니다.
+노드는 상태 전체가 아니라 **바뀐 부분만** 반환하고(예: `{"approved": True}`), Reducer가 기존 상태와 합칩니다. 특히 여러 노드가 **동시에** 같은 키에 값을 쓸 때 Reducer가 없으면, LangGraph는 "둘 중 무엇을 남길지 모르겠다"며 충돌 에러를 냅니다.
 
 ### 2. 노드, 엣지, 조건부 엣지
+
+4주차 루프를 그래프로 옮겨보면 노드 두 개(모델 호출, 도구 실행)와 갈림길 하나로 표현됩니다.
 
 ```python
 from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langchain_anthropic import ChatAnthropic
 
+# bind_tools: 이 모델에게 "이 도구들을 쓸 수 있다"고 알려준다 (4주차의 TOOL_DEFS 역할)
 llm = ChatAnthropic(model="claude-haiku-4-5").bind_tools(tools)
 
 def call_model(state: State):
+    # 지금까지의 메시지를 모델에게 보내고, 응답을 messages에 "추가"한다 (add_messages reducer)
     return {"messages": [llm.invoke(state["messages"])]}
 
 def route(state: State):
+    # 갈림길: 마지막 응답에 도구 호출이 있으면 tools 노드로, 없으면 끝으로
     last = state["messages"][-1]
     return "tools" if last.tool_calls else END
 
-g = StateGraph(State)
-g.add_node("model", call_model)
-g.add_node("tools", ToolNode(tools))
-g.add_edge(START, "model")
-g.add_conditional_edges("model", route, ["tools", END])
-g.add_edge("tools", "model")
-graph = g.compile()
+g = StateGraph(State)                        # 이 상태 형식을 쓰는 그래프를 만든다
+g.add_node("model", call_model)              # 역 1: 모델 호출
+g.add_node("tools", ToolNode(tools))         # 역 2: 도구 실행 (ToolNode가 tool_result까지 만들어준다)
+g.add_edge(START, "model")                   # 시작하면 model로
+g.add_conditional_edges("model", route, ["tools", END])   # model 다음엔 route()가 고른 곳으로
+g.add_edge("tools", "model")                 # 도구 실행 후엔 다시 model로 (= 루프)
+graph = g.compile()                          # 실행 가능한 그래프로 확정
 ```
 
-이게 4주차 루프를 그래프로 옮긴 ReAct 에이전트입니다(`create_react_agent`나 `create_agent`가 이걸 한 줄로 만들어 줍니다). 직접 그려봐야 나중에 노드를 끼워 넣을 수 있습니다.
+이게 4주차 루프를 그래프로 옮긴 ReAct 에이전트입니다. 사실 `create_react_agent`나 `create_agent` 한 줄이면 똑같은 걸 만들어주지만, 직접 그려봐야 나중에 "모델 호출과 도구 실행 사이에 승인 노드를 끼워 넣는" 식의 수정을 할 수 있습니다.
 
 ### 3. Checkpointer와 thread
 
+**Checkpointer**는 그래프가 한 단계 진행할 때마다 상태를 저장해주는 장치입니다. 게임의 자동 저장과 같습니다. 덕분에 대화를 기억하고, 멈췄다가 이어가고, 과거 시점으로 돌아갈 수 있습니다.
+
 ```python
 from langgraph.checkpoint.memory import InMemorySaver
-# 프로덕션: from langgraph.checkpoint.postgres import PostgresSaver
+# 프로덕션: from langgraph.checkpoint.postgres import PostgresSaver  (프로세스가 죽어도 남도록 DB에)
 
-graph = g.compile(checkpointer=InMemorySaver())
-cfg = {"configurable": {"thread_id": "user-42"}}
+graph = g.compile(checkpointer=InMemorySaver())    # 저장 장치를 붙여서 컴파일
+cfg = {"configurable": {"thread_id": "user-42"}}  # 이 대화의 이름표
 graph.invoke({"messages": [("user", "내 주문 상태 알려줘")]}, cfg)
-graph.invoke({"messages": [("user", "그거 환불해줘")]}, cfg)   # 이전 대화를 기억
+# 같은 thread_id로 다시 부르면 저장된 상태에서 이어진다 → "그거"가 무엇인지 안다
+graph.invoke({"messages": [("user", "그거 환불해줘")]}, cfg)
 
-for snap in graph.get_state_history(cfg):     # 모든 체크포인트
+for snap in graph.get_state_history(cfg):     # 이 대화의 모든 저장 지점을 최신순으로
+    # checkpoint_id: 저장 지점 번호 / next: 그 시점에서 다음에 실행될 노드
     print(snap.config["configurable"]["checkpoint_id"], snap.next)
 ```
 
-- **thread_id**는 대화(또는 작업) 하나입니다. 같은 thread로 부르면 마지막 체크포인트에서 이어집니다.
-- **체크포인트**는 매 super-step(동시에 실행되는 노드 묶음) 후 저장됩니다. 과거 checkpoint_id로 invoke하면 그 시점부터 **다른 분기로** 다시 실행할 수 있습니다(time travel, 디버깅에 유용).
+- **thread_id**는 대화(또는 작업) 하나의 이름표입니다. 같은 thread_id로 부르면 마지막 체크포인트에서 이어집니다.
+- **체크포인트**는 매 **super-step**(동시에 실행되는 노드 한 묶음) 뒤에 저장됩니다. 과거 체크포인트의 `checkpoint_id`를 지정해 실행하면 그 시점부터 **다른 갈래로** 다시 실행할 수 있습니다. 이걸 **time travel**이라고 하며, "여기서 다르게 판단했다면?"을 확인하는 디버깅에 유용합니다.
 
 ### 4. interrupt: 사람 승인
+
+**interrupt**는 그래프를 특정 지점에서 멈추고 사람의 결정을 기다리게 합니다. 은행 창구 직원이 "이 금액은 팀장님 결재가 필요합니다"라며 서류를 올려두고 기다리는 것과 같습니다. 멈춘 동안 상태는 체크포인트에 저장되어 있으니 서버가 꺼져도 괜찮습니다.
 
 ```python
 from langgraph.types import interrupt, Command
 
 def approve_refund(state: State):
     req = state["refund_request"]
+    # 여기서 그래프가 멈춘다. 괄호 안의 내용이 "결재 서류"로 호출한 쪽에 전달된다
     decision = interrupt({"type": "approval", "amount": req["amount"], "order_id": req["order_id"]})
+    # 재개되면 사람이 준 값(resume=...)이 decision에 들어온다
     return {"approved": decision == "approve"}
 
-# 1) 실행하면 approve_refund에서 멈추고 __interrupt__ 페이로드를 돌려준다
+# 1) 실행하면 approve_refund에서 멈추고, 결과에 __interrupt__ (결재 서류)가 담겨 돌아온다
 result = graph.invoke({...}, cfg)
-print(result["__interrupt__"])
-# 2) 사람이 결정하면 같은 thread로 재개
+print(result["__interrupt__"])           # → UI에 "89,000원 환불을 승인할까요?"로 보여준다
+# 2) 사람이 결정하면 같은 thread로 재개한다 (몇 시간 뒤여도 된다)
 graph.invoke(Command(resume="approve"), cfg)
 ```
 
-interrupt가 있는 노드는 **재개될 때 처음부터 다시 실행**됩니다. 그래서 interrupt 앞에 부수효과(DB 쓰기, 메일 발송)를 두면 두 번 실행됩니다. 부수효과는 interrupt 뒤나 별도 노드에 둡니다.
+꼭 알아야 할 함정: interrupt가 있는 노드는 **재개될 때 그 노드의 처음부터 다시 실행**됩니다. 멈춘 줄 중간부터 이어지는 게 아닙니다. 그래서 interrupt **앞에** DB 쓰기나 메일 발송 같은 부수효과를 두면, 처음 실행할 때 한 번, 재개할 때 또 한 번, 총 두 번 실행됩니다. 부수효과는 interrupt 뒤나 별도 노드에 둡니다.
 
 ### 5. 스트리밍 모드
 
+그래프가 도는 동안 무슨 일이 일어나는지 실시간으로 받아볼 수 있습니다. 2주차의 SSE로 그대로 브라우저에 흘려보내면 "검색 중… → 답변 작성 중…" 같은 화면을 만들 수 있습니다.
+
 ```python
+# stream_mode에 여러 모드를 주면 (모드 이름, 내용) 쌍으로 받는다
 for mode, chunk in graph.stream(inputs, cfg, stream_mode=["updates", "messages"]):
     if mode == "messages":
-        token, meta = chunk
-        print(token.content, end="")          # LLM 토큰
-    else:
-        print("\n[노드 완료]", list(chunk))    # 어느 노드가 무엇을 바꿨나
+        token, meta = chunk                   # LLM이 만든 토큰 한 조각과 메타 정보(어느 노드인지 등)
+        print(token.content, end="")          # 타자 치듯 출력
+    else:                                     # mode == "updates"
+        print("\n[노드 완료]", list(chunk))    # 어느 노드가 끝났고 무엇을 바꿨나
 ```
 
-`updates`(노드별 변경분), `values`(전체 상태), `messages`(LLM 토큰), `custom`(노드 안에서 직접 내보내는 진행 이벤트)을 조합해 2주차 SSE로 그대로 내보냅니다.
+모드는 네 가지입니다. `updates`(노드별 변경분), `values`(매 단계 전체 상태), `messages`(LLM 토큰), `custom`(노드 안에서 직접 내보내는 진행 이벤트, 예: "파일 3/10 처리 중").
 
 ## 심화
 
 ### 상태 설계가 그래프 설계의 절반이다
 
-- 상태에는 **결정에 필요한 것만** 둡니다. 큰 문서 원문은 외부 저장소에 두고 ID만 넣으세요. 체크포인트가 매 단계 저장되므로 상태가 크면 저장 비용이 폭증합니다.
-- 노드 간 계약을 명확히: 각 노드가 읽는 키와 쓰는 키를 문서화합니다.
-- 서브그래프는 부모와 키를 공유하거나, 입력·출력 스키마를 따로 둬 캡슐화할 수 있습니다. 서브에이전트를 격리할 때 유용합니다.
+- **상태에는 결정에 필요한 것만** 둡니다. 체크포인트가 매 단계 상태 전체를 저장하므로, 문서 원문이나 이미지를 상태에 넣으면 단계마다 그 큰 덩어리가 계속 복사·저장되어 저장 비용이 폭증합니다. 큰 것은 외부 저장소에 두고 ID만 넣으세요. 이삿짐을 매번 들고 다니지 말고 보관증만 들고 다니는 것입니다.
+- **노드 간 약속을 명확히** 합니다. 각 노드가 어떤 키를 읽고 어떤 키를 쓰는지 문서화해두면, 노드를 바꾸거나 추가할 때 다른 노드를 망가뜨리지 않습니다.
+- **서브그래프**(그래프 안의 작은 그래프)는 부모와 키를 공유할 수도 있고, 입력·출력 형식을 따로 정해 내부를 감출 수도 있습니다. 서브에이전트의 컨텍스트를 격리할 때 유용합니다.
 
 ### Send로 동적 병렬화(map-reduce)
+
+검색 결과가 3개일 때는 워커 3개, 7개일 때는 7개를 띄우고 싶다면? 그래프를 그릴 때는 몇 개가 필요할지 모릅니다. **Send**는 실행 중에 "이 노드를 이 입력으로 N번 동시에 실행해"라고 지시하는 도구입니다.
 
 ```python
 from langgraph.types import Send
 
 def fan_out(state):
-    return [Send("research", {"topic": t}) for t in state["subtopics"]]   # 개수가 런타임에 정해짐
+    # 하위 주제 개수만큼 research 노드를 각기 다른 입력으로 동시에 실행 (개수가 실행 중에 정해짐)
+    return [Send("research", {"topic": t}) for t in state["subtopics"]]
 
+# plan 노드가 끝나면 fan_out()이 돌려준 Send 목록대로 research를 여러 개 띄운다
 g.add_conditional_edges("plan", fan_out, ["research"])
+# 각 research의 결과는 findings 키의 operator.add reducer로 하나의 리스트에 모인다 (reduce)
 ```
 
-8주차 Orchestrator-Workers와 보고서 에이전트의 섹션 병렬 작성에 씁니다.
+여러 갈래로 흩뿌리는 것(map)과 결과를 하나로 모으는 것(reduce)을 합쳐 **map-reduce**라고 합니다. 8주차 Orchestrator-Workers와 보고서의 섹션 병렬 작성에 씁니다.
 
 ### 내구성 모드와 실패 재개
 
-노드가 예외로 죽으면 마지막 성공 체크포인트에서 같은 thread로 다시 invoke해 재개할 수 있습니다. 같은 super-step에서 성공한 다른 노드의 결과는 pending write로 보존되어 다시 실행되지 않습니다. 노드에 `RetryPolicy`를 붙여 일시적 오류를 자동 재시도합니다. 장기 실행 신뢰성은 21주차에서 Temporal과 비교합니다.
+노드가 예외로 죽어도 처음부터 다시 할 필요가 없습니다. 같은 thread로 다시 실행하면 **마지막으로 성공한 체크포인트**에서 이어집니다. 같은 super-step에서 동시에 돌던 다른 노드가 이미 성공했다면, 그 결과는 "대기 중인 쓰기(pending write)"로 보존되어 다시 실행되지 않습니다. 노드에 `RetryPolicy`를 붙이면 일시적 오류(429, 타임아웃)를 자동으로 재시도합니다. 몇 시간씩 도는 작업의 신뢰성은 21주차에서 Temporal과 비교합니다.
 
 ### LangGraph를 쓰지 말아야 할 때
 
-흐름이 단순한 ReAct 루프뿐이고 일시정지·재개·분기가 필요 없다면 Agents SDK나 직접 구현이 더 가볍습니다. 그래프는 **통제와 내구성이 필요할 때** 비용을 정당화합니다.
+흐름이 단순한 ReAct 루프뿐이고, 일시정지·재개·분기가 필요 없다면 LangGraph는 과합니다. Agents SDK나 직접 구현이 더 가볍습니다. 그래프는 **통제(정해진 단계, 승인)와 내구성(중단 후 재개)이 필요할 때** 그 학습 비용과 코드량을 정당화합니다.
 
 ## 실습 과제: 승인 단계가 있는 환불 처리 에이전트
 
@@ -187,10 +220,10 @@ START → classify(문의 분류) ─┬─ 일반 문의 → answer(RAG, 6주�
 
 ## 흔한 실수
 
-- interrupt 앞에 부수효과를 둠 → 재개 시 중복 실행
-- 상태에 큰 객체(원문 문서, 이미지)를 넣음 → 체크포인트 저장소 폭증
-- 병렬 노드가 같은 키를 쓰는데 Reducer 없음 → `InvalidUpdateError`
-- thread_id를 사용자 ID로만 씀 → 한 사용자의 여러 대화가 섞입니다. 대화 ID를 따로 둡니다.
+- **interrupt 앞에 부수효과를 둠:** 재개할 때 노드가 처음부터 다시 돌아서 메일이 두 번 나가고 환불이 두 번 됩니다.
+- **상태에 큰 객체(원문 문서, 이미지)를 넣음:** 체크포인트마다 복사되어 저장소가 순식간에 커집니다.
+- **병렬 노드가 같은 키를 쓰는데 Reducer 없음:** `InvalidUpdateError`가 납니다. 리스트라면 `operator.add`를 붙이세요.
+- **thread_id를 사용자 ID로만 씀:** 한 사용자가 대화를 여러 개 열면 전부 한 대화로 섞입니다. 대화마다 별도 ID를 둡니다.
 
 ## 면접 질문
 
